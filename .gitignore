@@ -1,0 +1,7 @@
+.snapvault/
+build/
+*.class
+*.jar
+.idea/
+*.iml
+.DS_Store

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+jar_path="$project_dir/build/snapvault.jar"
+
+if [ ! -f "$jar_path" ] || find "$project_dir/src/main/java" -type f -newer "$jar_path" | grep -q .; then
+    make -s -C "$project_dir" jar
+fi
+
+exec java -jar "$jar_path" "$@"
