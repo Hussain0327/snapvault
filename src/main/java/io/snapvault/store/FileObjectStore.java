@@ -35,6 +35,13 @@ public final class FileObjectStore implements ObjectStore {
     private static final int BUFFER_SIZE = 64 * 1024;
     private static final int MAX_HEADER_BYTES = 128;
 
+    /**
+     * Ceiling on an object read whole into memory. Far above any legitimate tree or commit,
+     * and far below what a deliberately or accidentally corrupt header could otherwise make
+     * this process allocate. Blobs are streamed and are not subject to it.
+     */
+    private static final long MAX_INLINE_PAYLOAD = 256L * 1024 * 1024;
+
     private final Path objectsDirectory;
 
     public FileObjectStore(Path objectsDirectory) throws IOException {
@@ -69,7 +76,7 @@ public final class FileObjectStore implements ObjectStore {
         Files.createDirectories(objectsDirectory);
         Path temporary = Files.createTempFile(objectsDirectory, "tmp-", ".object");
         MessageDigest digest = Sha256.newDigest();
-        byte[] header = header(type, payloadSize);
+        byte[] header = ObjectId.header(type, payloadSize);
         long copied = 0;
 
         try {
@@ -133,7 +140,7 @@ public final class FileObjectStore implements ObjectStore {
     @Override
     public StoredObject get(String objectId) throws IOException {
         ByteArrayOutputStream payload = new ByteArrayOutputStream();
-        ObjectType type = copyVerified(objectId, null, payload);
+        ObjectType type = copyVerified(objectId, null, payload, MAX_INLINE_PAYLOAD);
         return new StoredObject(type, payload.toByteArray());
     }
 
@@ -142,11 +149,15 @@ public final class FileObjectStore implements ObjectStore {
             String objectId, ObjectType expectedType, OutputStream destination) throws IOException {
         Objects.requireNonNull(expectedType, "expectedType");
         Objects.requireNonNull(destination, "destination");
-        copyVerified(objectId, expectedType, destination);
+        copyVerified(objectId, expectedType, destination, Long.MAX_VALUE);
     }
 
     private ObjectType copyVerified(
-            String objectId, ObjectType expectedType, OutputStream destination) throws IOException {
+            String objectId,
+            ObjectType expectedType,
+            OutputStream destination,
+            long maximumPayloadSize)
+            throws IOException {
         Path objectPath = pathFor(objectId);
         if (!Files.isRegularFile(objectPath, LinkOption.NOFOLLOW_LINKS)) {
             throw new IOException("Object does not exist: " + objectId);
@@ -158,6 +169,13 @@ public final class FileObjectStore implements ObjectStore {
                 InflaterInputStream decompressed = new InflaterInputStream(fileInput);
                 DigestInputStream canonical = new DigestInputStream(decompressed, digest)) {
             parsed = readHeader(canonical);
+            if (parsed.payloadSize() > maximumPayloadSize) {
+                throw new IOException(
+                        "Object "
+                                + objectId
+                                + " declares an implausible payload size: "
+                                + parsed.payloadSize());
+            }
             if (expectedType != null && parsed.type() != expectedType) {
                 throw new IOException(
                         "Object "
@@ -231,10 +249,6 @@ public final class FileObjectStore implements ObjectStore {
             destination.write(buffer, 0, read);
             remaining -= read;
         }
-    }
-
-    private static byte[] header(ObjectType type, long payloadSize) {
-        return (type.token() + " " + payloadSize + "\0").getBytes(StandardCharsets.US_ASCII);
     }
 
     @Override

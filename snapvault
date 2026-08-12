@@ -1,7 +1,18 @@
 #!/bin/sh
 set -eu
 
-project_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Resolve $0 through any symlinks so the launcher works when installed on PATH.
+script=$0
+while [ -L "$script" ]; do
+    script_dir=$(CDPATH= cd -- "$(dirname -- "$script")" && pwd)
+    script=$(readlink -- "$script")
+    case "$script" in
+        /*) ;;
+        *) script="$script_dir/$script" ;;
+    esac
+done
+
+project_dir=$(CDPATH= cd -- "$(dirname -- "$script")" && pwd)
 jar_path="$project_dir/build/snapvault.jar"
 
 if [ ! -f "$jar_path" ] || find "$project_dir/src/main/java" -type f -newer "$jar_path" | grep -q .; then

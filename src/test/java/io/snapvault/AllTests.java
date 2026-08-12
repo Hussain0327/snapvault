@@ -15,6 +15,7 @@ import io.snapvault.store.StoredObject;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -27,7 +28,9 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.zip.DeflaterOutputStream;
 
 /** Minimal dependency-free test runner used by {@code make test}. */
 public final class AllTests {
@@ -47,6 +50,15 @@ public final class AllTests {
         run("restore protects dirty work and preserves history", this::restoreIsSafe);
         run("restore validates objects before changing files", this::restorePreflightsObjects);
         run("symlinks survive a snapshot round trip", this::symlinkRoundTrip);
+        run("diff sees empty directories", this::diffSeesEmptyDirectories);
+        run("working-tree diff writes no objects", this::workingTreeDiffWritesNoObjects);
+        run("chained ancestor revisions resolve", this::chainedAncestorRevisionsResolve);
+        run("filesystem errors explain themselves", this::filesystemErrorsExplainThemselves);
+        run("restore refuses names the filesystem cannot represent", this::restoreRefusesUnrepresentableNames);
+        run("oversized objects are rejected before allocating", this::oversizedObjectsAreRejected);
+        run("nested repositories are not captured", this::nestedRepositoriesAreNotCaptured);
+        run("restore refuses targets inside the repository", this::restoreRefusesInternalTargets);
+        run("an interrupted restore blocks snapshot and diff", this::interruptedRestoreBlocksWork);
         run("CLI supports init snapshot log diff and restore", this::cliEndToEnd);
         System.out.println();
         System.out.println(passed + " tests passed");
@@ -290,6 +302,7 @@ public final class AllTests {
                 assertEquals(0, cli.run("-C", "notes", "log", "--oneline"), "CLI log exit code");
 
                 Files.writeString(root.resolve("todo.txt"), "edited");
+                Files.createDirectory(root.resolve("scratch"));
                 assertEquals(0, cli.run("-C", "notes", "diff"), "CLI diff exit code");
                 assertEquals(
                         0,
@@ -303,10 +316,286 @@ public final class AllTests {
             assertContains(output, "Snapshot ", "snapshot output");
             assertContains(output, "initial notes", "log output");
             assertContains(output, "M\ttodo.txt", "diff output");
+            assertContains(output, "A\tscratch/", "directories are marked in diff output");
             assertContains(output, "Restored ", "restore output");
             assertEquals("", stderr.toString(StandardCharsets.UTF_8), "successful CLI should not use stderr");
         } finally {
             deleteTree(temporary);
+        }
+    }
+
+    private void diffSeesEmptyDirectories() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-empty-directory-test-");
+        try {
+            Path root = temporary.resolve("files");
+            Files.createDirectories(root);
+            Files.writeString(root.resolve("keep.txt"), "content");
+            Repository repository = Repository.init(root);
+            repository.snapshot("baseline");
+
+            Path scratch = root.resolve("scratch");
+            Files.createDirectory(scratch);
+            List<FileChange> added = repository.diffWorkingFromHead();
+            assertChangeTypes(added, Map.of("scratch", ChangeType.ADDED));
+            assertEquals(
+                    EntryKind.DIRECTORY,
+                    added.getFirst().after().kind(),
+                    "an empty directory is reported as a directory");
+
+            repository.snapshot("with an empty directory");
+            assertEquals(List.of(), repository.diffWorkingFromHead(), "the snapshot clears the change");
+            repository.restore("HEAD", null, false);
+
+            Files.delete(scratch);
+            assertChangeTypes(repository.diffWorkingFromHead(), Map.of("scratch", ChangeType.DELETED));
+
+            Files.createDirectory(scratch);
+            Files.writeString(scratch.resolve("later.txt"), "a file appears");
+            assertChangeTypes(
+                    repository.diffWorkingFromHead(), Map.of("scratch/later.txt", ChangeType.ADDED));
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void workingTreeDiffWritesNoObjects() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-read-only-diff-test-");
+        try {
+            Path root = temporary.resolve("files");
+            Files.createDirectories(root);
+            Files.writeString(root.resolve("tracked.txt"), "content");
+            Repository repository = Repository.init(root);
+            repository.snapshot("baseline");
+            Files.writeString(root.resolve("untracked.txt"), "not snapshotted yet");
+
+            long before = repository.objectCount();
+            repository.diffWorkingFromHead();
+            repository.diffWorking("HEAD");
+            assertEquals(before, repository.objectCount(), "diff must not write objects");
+
+            assertThrows(
+                    IOException.class,
+                    () -> repository.restore("HEAD", null, false),
+                    "restore must still refuse a dirty working tree");
+            assertEquals(
+                    before, repository.objectCount(), "a refused restore must not write objects");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void chainedAncestorRevisionsResolve() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-revision-test-");
+        try {
+            Path root = temporary.resolve("files");
+            Files.createDirectories(root);
+            Repository repository = Repository.init(root);
+            Files.writeString(root.resolve("one.txt"), "one");
+            repository.snapshot("one");
+            Files.writeString(root.resolve("two.txt"), "two");
+            repository.snapshot("two");
+            Files.writeString(root.resolve("three.txt"), "three");
+            repository.snapshot("three");
+
+            assertEquals(
+                    repository.resolveCommit("HEAD~1"),
+                    repository.resolveCommit("HEAD~"),
+                    "a bare tilde means one generation");
+            assertEquals(
+                    repository.resolveCommit("HEAD~2"),
+                    repository.resolveCommit("HEAD~1~1"),
+                    "chained tildes accumulate");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void filesystemErrorsExplainThemselves() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-error-message-test-");
+        try {
+            Path root = temporary.resolve("files");
+            Files.createDirectories(root);
+            Path unreadable = root.resolve("locked.txt");
+            Files.writeString(unreadable, "secret");
+            if (!unreadable.toFile().setReadable(false, false) || Files.isReadable(unreadable)) {
+                System.out.println("SKIP unreadable files cannot be simulated for this user");
+                return;
+            }
+
+            ByteArrayOutputStream stderr = new ByteArrayOutputStream();
+            try (PrintStream out =
+                            new PrintStream(OutputStream.nullOutputStream(), true, StandardCharsets.UTF_8);
+                    PrintStream err = new PrintStream(stderr, true, StandardCharsets.UTF_8)) {
+                Cli cli = new Cli(out, err, root);
+                assertEquals(0, cli.run("init"), "CLI init exit code");
+                assertEquals(1, cli.run("snapshot", "-m", "locked"), "CLI snapshot must fail");
+            }
+            assertContains(
+                    stderr.toString(StandardCharsets.UTF_8),
+                    "permission denied",
+                    "an unreadable file must explain why the snapshot failed");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void restoreRefusesUnrepresentableNames() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-case-clash-test-");
+        try {
+            Path root = temporary.resolve("source");
+            Files.createDirectories(root);
+            Files.writeString(root.resolve("ordinary.txt"), "content");
+            Repository repository = Repository.init(root);
+            repository.snapshot("baseline");
+
+            // A snapshot authored on a case-sensitive filesystem can legitimately hold two sibling
+            // names that differ only by case. Build one directly, the way such a repository arrives.
+            FileObjectStore store = new FileObjectStore(repository.metadata().resolve("objects"));
+            String lower = store.put(ObjectType.BLOB, "lower".getBytes(StandardCharsets.UTF_8));
+            String upper = store.put(ObjectType.BLOB, "UPPER".getBytes(StandardCharsets.UTF_8));
+            Tree tree = new Tree(List.of(
+                    new TreeEntry("clash.txt", EntryKind.FILE, lower, false),
+                    new TreeEntry("CLASH.txt", EntryKind.FILE, upper, false)));
+            Commit commit = new Commit(
+                    store.put(ObjectType.TREE, tree.encode()),
+                    List.of(),
+                    Instant.parse("2026-08-12T00:00:00Z"),
+                    "case clash");
+            String commitId = store.put(ObjectType.COMMIT, commit.encode());
+            Path external = temporary.resolve("export");
+
+            if (isCaseSensitive(temporary)) {
+                repository.restore(commitId, external, false);
+                assertEquals("lower", Files.readString(external.resolve("clash.txt")), "lower entry");
+                assertEquals("UPPER", Files.readString(external.resolve("CLASH.txt")), "upper entry");
+            } else {
+                assertThrows(
+                        IOException.class,
+                        () -> repository.restore(commitId, external, false),
+                        "this filesystem cannot represent both entries");
+                assertFalse(
+                        Files.exists(external.resolve("CLASH.txt")),
+                        "the refusal must come before anything is written");
+            }
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void oversizedObjectsAreRejected() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-oversize-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+            String objectId = "aa" + "0".repeat(61) + "1";
+            Path shard = objects.resolve(objectId.substring(0, 2));
+            Files.createDirectories(shard);
+
+            byte[] header =
+                    ("tree " + (300L * 1024 * 1024) + "\0").getBytes(StandardCharsets.US_ASCII);
+            try (OutputStream file = Files.newOutputStream(shard.resolve(objectId.substring(2)));
+                    DeflaterOutputStream compressed = new DeflaterOutputStream(file)) {
+                compressed.write(header);
+                compressed.write(new byte[1024]);
+            }
+
+            IOException failure = null;
+            try {
+                store.get(objectId);
+            } catch (IOException exception) {
+                failure = exception;
+            }
+            assertTrue(failure != null, "an implausible declared payload size must fail");
+            assertContains(
+                    failure.getMessage(),
+                    "implausible",
+                    "the header must be rejected before the payload is buffered");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void nestedRepositoriesAreNotCaptured() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-nested-test-");
+        try {
+            Path root = temporary.resolve("outer");
+            Files.createDirectories(root);
+            Files.writeString(root.resolve("outer.txt"), "outer content");
+            Repository outer = Repository.init(root);
+            outer.snapshot("baseline");
+
+            Path inner = root.resolve("inner");
+            Files.createDirectories(inner);
+            Files.writeString(inner.resolve("note.txt"), "inner content");
+            Repository.init(inner);
+
+            assertChangeTypes(
+                    outer.diffWorkingFromHead(), Map.of("inner/note.txt", ChangeType.ADDED));
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void restoreRefusesInternalTargets() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-internal-target-test-");
+        try {
+            Path root = temporary.resolve("source");
+            Files.createDirectories(root.resolve("sub"));
+            Files.writeString(root.resolve("a.txt"), "a");
+            Files.writeString(root.resolve("sub/b.txt"), "b");
+            Repository repository = Repository.init(root);
+            String commitId = repository.snapshot("baseline");
+
+            assertThrows(
+                    IOException.class,
+                    () -> repository.restore(commitId, root.resolve("sub"), true),
+                    "restore must refuse a target inside the repository");
+            assertEquals(
+                    "b", Files.readString(root.resolve("sub/b.txt")), "the refusal must not touch files");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void interruptedRestoreBlocksWork() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-interrupted-test-");
+        try {
+            Path root = temporary.resolve("source");
+            Files.createDirectories(root);
+            Files.writeString(root.resolve("a.txt"), "a");
+            Repository repository = Repository.init(root);
+            String commitId = repository.snapshot("baseline");
+
+            Path marker = repository.metadata().resolve("restore-in-progress");
+            Files.writeString(
+                    marker,
+                    commitId + System.lineSeparator() + repository.root() + System.lineSeparator());
+
+            assertThrows(
+                    IOException.class,
+                    () -> repository.snapshot("after a crash"),
+                    "snapshot must refuse an incomplete working tree");
+            assertThrows(
+                    IOException.class,
+                    repository::diffWorkingFromHead,
+                    "diff must refuse an incomplete working tree");
+            assertEquals(commitId, repository.head().orElseThrow(), "history stays readable");
+
+            repository.restore(commitId, null, true);
+            assertFalse(Files.exists(marker), "a completed restore clears the marker");
+            repository.snapshot("recovered");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private static boolean isCaseSensitive(Path directory) throws IOException {
+        Path probe = Files.createTempFile(directory, "case-probe-", ".tmp");
+        try {
+            String upper = probe.getFileName().toString().toUpperCase(Locale.ROOT);
+            return !Files.exists(directory.resolve(upper), LinkOption.NOFOLLOW_LINKS);
+        } finally {
+            Files.deleteIfExists(probe);
         }
     }
 

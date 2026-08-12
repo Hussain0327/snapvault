@@ -7,12 +7,15 @@ import io.snapvault.model.EntryKind;
 import io.snapvault.model.Tree;
 import io.snapvault.model.TreeEntry;
 import io.snapvault.store.FileObjectStore;
+import io.snapvault.store.ObjectId;
 import io.snapvault.store.ObjectStore;
 import io.snapvault.store.ObjectType;
 import io.snapvault.store.StoredObject;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
@@ -20,27 +23,34 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.text.Normalizer;
 import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 /** The high-level SnapVault repository API used by the CLI and tests. */
 public final class Repository {
     public static final String METADATA_DIRECTORY = ".snapvault";
     private static final String FORMAT = "snapvault 1";
     private static final String DEFAULT_REF = "refs/heads/main";
+    private static final String RESTORE_MARKER = "restore-in-progress";
 
     private final Path root;
     private final Path metadata;
@@ -132,7 +142,8 @@ public final class Repository {
 
         try (RepositoryLock repositoryLock = RepositoryLock.acquire(metadata.resolve("lock"))) {
             repositoryLock.ensureHeld();
-            String treeId = writeTree(root);
+            requireCompleteWorkingTree();
+            String treeId = scan(root, "", storingSink(), new TreeMap<>());
             Optional<String> parent = head();
             Commit commit = new Commit(
                     treeId,
@@ -176,32 +187,47 @@ public final class Repository {
         return Tree.decode(object.payload());
     }
 
-    /** Resolves HEAD, HEAD~N, a full commit id, or an unambiguous 7+ character prefix. */
+    /**
+     * Resolves HEAD, a full commit id, or an unambiguous 7+ character prefix, optionally followed
+     * by one or more ancestor steps. {@code ~} means one generation and {@code ~N} means N, and
+     * repeated steps accumulate, so {@code HEAD~1~1} and {@code HEAD~2} name the same snapshot.
+     */
     public String resolveCommit(String revision) throws IOException {
         if (revision == null || revision.isBlank()) {
             throw new IllegalArgumentException("Snapshot revision cannot be empty");
         }
         String spec = revision.strip();
-        int generations = 0;
-        int tilde = spec.lastIndexOf('~');
-        if (tilde >= 0) {
+        long generations = 0;
+        int tilde;
+        while ((tilde = spec.lastIndexOf('~')) >= 0) {
             String suffix = spec.substring(tilde + 1);
-            if (suffix.isEmpty() || !suffix.chars().allMatch(Character::isDigit)) {
+            long step;
+            if (suffix.isEmpty()) {
+                step = 1;
+            } else if (suffix.chars().allMatch(Character::isDigit)) {
+                try {
+                    step = Long.parseLong(suffix);
+                } catch (NumberFormatException exception) {
+                    throw new IOException("Ancestor count is too large: " + suffix, exception);
+                }
+            } else {
                 throw new IOException("Invalid ancestor expression: " + revision);
             }
-            try {
-                generations = Integer.parseInt(suffix);
-            } catch (NumberFormatException exception) {
-                throw new IOException("Ancestor count is too large: " + suffix, exception);
+            generations += step;
+            if (generations < 0) {
+                throw new IOException("Ancestor count is too large: " + revision);
             }
             spec = spec.substring(0, tilde);
+        }
+        if (spec.isEmpty()) {
+            throw new IOException("Revision names no starting snapshot: " + revision);
         }
 
         String objectId;
         if (spec.equals("HEAD") || spec.equals("@")) {
             objectId = head().orElseThrow(() -> new IOException("No snapshots exist yet"));
         } else if (spec.length() == Sha256.HEX_LENGTH) {
-            objectId = spec.toLowerCase(java.util.Locale.ROOT);
+            objectId = spec.toLowerCase(Locale.ROOT);
             try {
                 Sha256.requireObjectId(objectId);
             } catch (IllegalArgumentException exception) {
@@ -233,7 +259,7 @@ public final class Repository {
         }
 
         readCommit(objectId);
-        for (int index = 0; index < generations; index++) {
+        for (long index = 0; index < generations; index++) {
             Commit commit = readCommit(objectId);
             if (commit.parents().isEmpty()) {
                 throw new IOException(revision + " walks beyond the beginning of history");
@@ -276,12 +302,13 @@ public final class Repository {
         return diffTrees(before.treeId(), after.treeId());
     }
 
-    /** Compares one stored snapshot to the live working directory. */
+    /** Compares one stored snapshot to the live working directory without writing objects. */
     public List<FileChange> diffWorking(String fromRevision) throws IOException {
         Commit before = readCommit(resolveCommit(fromRevision));
         try (RepositoryLock repositoryLock = RepositoryLock.acquire(metadata.resolve("lock"))) {
             repositoryLock.ensureHeld();
-            return diffTrees(before.treeId(), writeTree(root));
+            requireCompleteWorkingTree();
+            return compare(flatten(before.treeId()), scanWorkingTree());
         }
     }
 
@@ -289,21 +316,26 @@ public final class Repository {
     public List<FileChange> diffWorkingFromHead() throws IOException {
         try (RepositoryLock repositoryLock = RepositoryLock.acquire(metadata.resolve("lock"))) {
             repositoryLock.ensureHeld();
-            String beforeTree;
+            requireCompleteWorkingTree();
             Optional<String> current = head();
-            if (current.isPresent()) {
-                beforeTree = readCommit(current.get()).treeId();
-            } else {
-                beforeTree = objectStore.put(ObjectType.TREE, new Tree(List.of()).encode());
-            }
-            return diffTrees(beforeTree, writeTree(root));
+            NavigableMap<String, TreeEntry> before = current.isPresent()
+                    ? flatten(readCommit(current.get()).treeId())
+                    : new TreeMap<>();
+            return compare(before, scanWorkingTree());
         }
     }
 
     private List<FileChange> diffTrees(String beforeTreeId, String afterTreeId) throws IOException {
-        Map<String, TreeEntry> before = flatten(beforeTreeId);
-        Map<String, TreeEntry> after = flatten(afterTreeId);
-        Set<String> allPaths = new java.util.TreeSet<>();
+        return compare(flatten(beforeTreeId), flatten(afterTreeId));
+    }
+
+    /**
+     * Compares two flattened trees. Both sides contain every file, symbolic link, and empty
+     * directory, so an empty set of changes always means the two trees are byte-for-byte identical.
+     */
+    private static List<FileChange> compare(
+            NavigableMap<String, TreeEntry> before, NavigableMap<String, TreeEntry> after) {
+        Set<String> allPaths = new TreeSet<>();
         allPaths.addAll(before.keySet());
         allPaths.addAll(after.keySet());
 
@@ -312,9 +344,13 @@ public final class Repository {
             TreeEntry oldEntry = before.get(path);
             TreeEntry newEntry = after.get(path);
             if (oldEntry == null) {
-                changes.add(new FileChange(ChangeType.ADDED, path, null, newEntry));
+                if (!hasDescendants(newEntry, path, before)) {
+                    changes.add(new FileChange(ChangeType.ADDED, path, null, newEntry));
+                }
             } else if (newEntry == null) {
-                changes.add(new FileChange(ChangeType.DELETED, path, oldEntry, null));
+                if (!hasDescendants(oldEntry, path, after)) {
+                    changes.add(new FileChange(ChangeType.DELETED, path, oldEntry, null));
+                }
             } else if (oldEntry.kind() != newEntry.kind()) {
                 changes.add(new FileChange(ChangeType.TYPE_CHANGED, path, oldEntry, newEntry));
             } else if (!oldEntry.objectId().equals(newEntry.objectId())
@@ -325,16 +361,34 @@ public final class Repository {
         return List.copyOf(changes);
     }
 
-    private Map<String, TreeEntry> flatten(String treeId) throws IOException {
-        Map<String, TreeEntry> entries = new TreeMap<>();
+    /**
+     * Reports whether a directory that is empty on one side holds entries on the other side. Those
+     * entries already describe the difference, so reporting the directory itself would be noise.
+     */
+    private static boolean hasDescendants(
+            TreeEntry entry, String path, NavigableMap<String, TreeEntry> otherSide) {
+        if (entry.kind() != EntryKind.DIRECTORY) {
+            return false;
+        }
+        String prefix = path + "/";
+        Map.Entry<String, TreeEntry> nearest = otherSide.ceilingEntry(prefix);
+        return nearest != null && nearest.getKey().startsWith(prefix);
+    }
+
+    private NavigableMap<String, TreeEntry> flatten(String treeId) throws IOException {
+        NavigableMap<String, TreeEntry> entries = new TreeMap<>();
         flatten(treeId, "", entries, new HashSet<>());
         return entries;
     }
 
+    /**
+     * Collects the leaves of a tree: every file, every symbolic link, and every directory that
+     * contains nothing, because an empty directory is itself part of the snapshotted state.
+     */
     private void flatten(
             String treeId,
             String prefix,
-            Map<String, TreeEntry> flattened,
+            NavigableMap<String, TreeEntry> flattened,
             Set<String> ancestors)
             throws IOException {
         if (!ancestors.add(treeId)) {
@@ -344,7 +398,11 @@ public final class Repository {
             for (TreeEntry entry : readTree(treeId).entries()) {
                 String path = prefix.isEmpty() ? entry.name() : prefix + "/" + entry.name();
                 if (entry.kind() == EntryKind.DIRECTORY) {
+                    int leavesBefore = flattened.size();
                     flatten(entry.objectId(), path, flattened, ancestors);
+                    if (flattened.size() == leavesBefore) {
+                        flattened.put(path, entry);
+                    }
                 } else {
                     flattened.put(path, entry);
                 }
@@ -380,20 +438,131 @@ public final class Repository {
                     throw new IOException(
                             "Working directory has unsnapshotted changes; rerun restore with --force");
                 }
-                clearDirectory(root, metadata);
             } else {
-                prepareExternalTarget(target, force);
+                openExternalTarget(target, force);
             }
+            verifyNamesAreRepresentable(commit.treeId(), target);
+
+            beginRestore(commitId, target);
+            clearDirectory(target, inPlace ? metadata : null);
             materializeTree(commit.treeId(), target);
+            endRestore();
+        }
+    }
+
+    /** A restore that began but never finished, so the tree it targeted is incomplete. */
+    public record InterruptedRestore(String commitId, Path target) {
+    }
+
+    /** Returns the restore that was interrupted, if one left a target half-written. */
+    public Optional<InterruptedRestore> interruptedRestore() throws IOException {
+        Path marker = metadata.resolve(RESTORE_MARKER);
+        if (!Files.exists(marker, LinkOption.NOFOLLOW_LINKS)) {
+            return Optional.empty();
+        }
+        List<String> lines = Files.readAllLines(marker, StandardCharsets.UTF_8);
+        if (lines.size() < 2) {
+            throw new IOException("A restore was interrupted and its marker is unreadable: " + marker);
+        }
+        return Optional.of(
+                new InterruptedRestore(lines.get(0).strip(), Path.of(lines.get(1).strip())));
+    }
+
+    /**
+     * Records a restore before it removes anything, and forces the record to disk. A crash between
+     * clearing and materializing is otherwise indistinguishable from an empty directory.
+     */
+    private void beginRestore(String commitId, Path target) throws IOException {
+        byte[] content = (commitId + System.lineSeparator() + target + System.lineSeparator())
+                .getBytes(StandardCharsets.UTF_8);
+        try (FileChannel channel = FileChannel.open(
+                metadata.resolve(RESTORE_MARKER),
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING)) {
+            channel.write(ByteBuffer.wrap(content));
+            channel.force(true);
+        }
+    }
+
+    private void endRestore() throws IOException {
+        Files.deleteIfExists(metadata.resolve(RESTORE_MARKER));
+    }
+
+    /**
+     * Refuses work that a half-restored working tree would silently corrupt. Only an interrupted
+     * in-place restore leaves this repository's own files incomplete; an external target does not.
+     */
+    private void requireCompleteWorkingTree() throws IOException {
+        Optional<InterruptedRestore> interrupted = interruptedRestore();
+        if (interrupted.isEmpty() || !interrupted.get().target().equals(root)) {
+            return;
+        }
+        String commitId = interrupted.get().commitId();
+        throw new IOException(
+                "A restore of "
+                        + commitId
+                        + " was interrupted, so the working directory is incomplete; finish it with"
+                        + " 'snapvault restore "
+                        + commitId
+                        + " --force'");
+    }
+
+    /**
+     * Refuses, before anything is removed, a snapshot holding sibling names this filesystem cannot
+     * keep apart. Names differing only in case or Unicode composition are distinct in a snapshot
+     * but one file here, so materializing them would silently discard one.
+     */
+    private void verifyNamesAreRepresentable(String treeId, Path target) throws IOException {
+        if (distinguishesNameCase(target)) {
+            return;
+        }
+        verifyNamesAreRepresentable(treeId, "", new HashSet<>());
+    }
+
+    private void verifyNamesAreRepresentable(String treeId, String prefix, Set<String> checked)
+            throws IOException {
+        if (!checked.add(treeId)) {
+            return;
+        }
+        Map<String, String> byFoldedName = new HashMap<>();
+        for (TreeEntry entry : readTree(treeId).entries()) {
+            String folded =
+                    Normalizer.normalize(entry.name(), Normalizer.Form.NFC).toLowerCase(Locale.ROOT);
+            String clashing = byFoldedName.put(folded, entry.name());
+            if (clashing != null) {
+                throw new IOException(
+                        "This filesystem cannot keep \""
+                                + clashing
+                                + "\" and \""
+                                + entry.name()
+                                + "\" apart in "
+                                + (prefix.isEmpty() ? "the snapshot root" : prefix)
+                                + "; restore on a case-sensitive filesystem instead");
+            }
+            if (entry.kind() == EntryKind.DIRECTORY) {
+                String path = prefix.isEmpty() ? entry.name() : prefix + "/" + entry.name();
+                verifyNamesAreRepresentable(entry.objectId(), path, checked);
+            }
+        }
+    }
+
+    /** Probes whether {@code directory} keeps names that differ only by case apart. */
+    private static boolean distinguishesNameCase(Path directory) throws IOException {
+        Path probe = Files.createTempFile(directory, "snapvault-probe-", ".tmp");
+        try {
+            String upper = probe.getFileName().toString().toUpperCase(Locale.ROOT);
+            return !Files.exists(directory.resolve(upper), LinkOption.NOFOLLOW_LINKS);
+        } finally {
+            Files.deleteIfExists(probe);
         }
     }
 
     private boolean isWorkingTreeDirty() throws IOException {
-        String workingTree = writeTree(root);
+        String workingTree = scan(root, "", hashingSink(), new TreeMap<>());
         Optional<String> current = head();
         if (current.isEmpty()) {
-            String emptyTree = objectStore.put(ObjectType.TREE, new Tree(List.of()).encode());
-            return !workingTree.equals(emptyTree);
+            return !workingTree.equals(ObjectId.of(ObjectType.TREE, new Tree(List.of()).encode()));
         }
         return !workingTree.equals(readCommit(current.get()).treeId());
     }
@@ -411,6 +580,11 @@ public final class Repository {
         }
         if (target.startsWith(metadata) || root.startsWith(target)) {
             throw new IOException("Restore target would overwrite the SnapVault repository");
+        }
+        if (target.startsWith(root)) {
+            throw new IOException(
+                    "Restore target is inside the repository and would be captured by the next"
+                            + " snapshot; choose a directory outside " + root);
         }
     }
 
@@ -431,7 +605,7 @@ public final class Repository {
         return canonical.normalize();
     }
 
-    private static void prepareExternalTarget(Path target, boolean force) throws IOException {
+    private static void openExternalTarget(Path target, boolean force) throws IOException {
         if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
             Files.createDirectories(target);
             return;
@@ -439,15 +613,13 @@ public final class Repository {
         if (!Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
             throw new IOException("Restore target is not a directory: " + target);
         }
-        boolean hasChildren;
-        try (DirectoryStream<Path> children = Files.newDirectoryStream(target)) {
-            hasChildren = children.iterator().hasNext();
+        if (force) {
+            return;
         }
-        if (hasChildren) {
-            if (!force) {
+        try (DirectoryStream<Path> children = Files.newDirectoryStream(target)) {
+            if (children.iterator().hasNext()) {
                 throw new IOException("Restore target is not empty; rerun with --force");
             }
-            clearDirectory(target, null);
         }
     }
 
@@ -485,6 +657,10 @@ public final class Repository {
             Path destination = directory.resolve(entry.name()).normalize();
             if (!destination.getParent().equals(directory)) {
                 throw new IOException("Unsafe path in snapshot: " + entry.name());
+            }
+            if (Files.exists(destination, LinkOption.NOFOLLOW_LINKS)) {
+                throw new IOException(
+                        "Two entries in this snapshot resolve to the same file: " + destination);
             }
             switch (entry.kind()) {
                 case DIRECTORY -> materializeTree(entry.objectId(), destination);
@@ -526,11 +702,27 @@ public final class Repository {
         Files.createSymbolicLink(destination, Path.of(target));
     }
 
-    private String writeTree(Path directory) throws IOException {
+    /** Reads the working tree without writing anything, so diffing never grows the object store. */
+    private NavigableMap<String, TreeEntry> scanWorkingTree() throws IOException {
+        NavigableMap<String, TreeEntry> leaves = new TreeMap<>();
+        scan(root, "", hashingSink(), leaves);
+        return leaves;
+    }
+
+    /**
+     * Walks {@code directory}, feeding what it finds to {@code sink} and recording every leaf in
+     * {@code leaves}, and returns the id of the tree object describing it.
+     */
+    private String scan(
+            Path directory,
+            String prefix,
+            TreeSink sink,
+            NavigableMap<String, TreeEntry> leaves)
+            throws IOException {
         List<Path> children = new ArrayList<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
             for (Path child : stream) {
-                if (directory.equals(root) && child.getFileName().toString().equals(METADATA_DIRECTORY)) {
+                if (child.equals(metadata) || isRepositoryMetadata(child)) {
                     continue;
                 }
                 children.add(child);
@@ -543,17 +735,25 @@ public final class Repository {
             BasicFileAttributes before = Files.readAttributes(
                     child, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
             String name = child.getFileName().toString();
+            String path = prefix.isEmpty() ? name : prefix + "/" + name;
             if (before.isSymbolicLink()) {
                 byte[] target = Files.readSymbolicLink(child)
                         .toString()
                         .getBytes(StandardCharsets.UTF_8);
-                String objectId = objectStore.put(ObjectType.BLOB, target);
-                entries.add(new TreeEntry(name, EntryKind.SYMLINK, objectId, false));
+                TreeEntry entry =
+                        new TreeEntry(name, EntryKind.SYMLINK, sink.symlinkTarget(target), false);
+                entries.add(entry);
+                leaves.put(path, entry);
             } else if (before.isDirectory()) {
-                String objectId = writeTree(child);
-                entries.add(new TreeEntry(name, EntryKind.DIRECTORY, objectId, false));
+                int leavesBefore = leaves.size();
+                String objectId = scan(child, path, sink, leaves);
+                TreeEntry entry = new TreeEntry(name, EntryKind.DIRECTORY, objectId, false);
+                entries.add(entry);
+                if (leaves.size() == leavesBefore) {
+                    leaves.put(path, entry);
+                }
             } else if (before.isRegularFile()) {
-                String objectId = objectStore.putBlob(child);
+                String objectId = sink.blob(child);
                 BasicFileAttributes after = Files.readAttributes(
                         child, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
                 if (!after.isRegularFile()
@@ -561,13 +761,75 @@ public final class Repository {
                         || !before.lastModifiedTime().equals(after.lastModifiedTime())) {
                     throw new IOException("File changed while snapshotting: " + child);
                 }
-                entries.add(new TreeEntry(name, EntryKind.FILE, objectId, Files.isExecutable(child)));
+                TreeEntry entry =
+                        new TreeEntry(name, EntryKind.FILE, objectId, Files.isExecutable(child));
+                entries.add(entry);
+                leaves.put(path, entry);
             } else {
                 throw new IOException("Unsupported filesystem entry: " + child);
             }
         }
 
-        return objectStore.put(ObjectType.TREE, new Tree(entries).encode());
+        return sink.tree(new Tree(entries));
+    }
+
+    /** Reports whether {@code child} is the metadata directory of a SnapVault repository. */
+    private static boolean isRepositoryMetadata(Path child) {
+        return child.getFileName().toString().equals(METADATA_DIRECTORY)
+                && Files.isRegularFile(child.resolve("format"), LinkOption.NOFOLLOW_LINKS);
+    }
+
+    /** Persists everything a scan discovers, for {@code snapshot}. */
+    private TreeSink storingSink() {
+        return new TreeSink() {
+            @Override
+            public String blob(Path file) throws IOException {
+                return objectStore.putBlob(file);
+            }
+
+            @Override
+            public String symlinkTarget(byte[] target) throws IOException {
+                return objectStore.put(ObjectType.BLOB, target);
+            }
+
+            @Override
+            public String tree(Tree tree) throws IOException {
+                return objectStore.put(ObjectType.TREE, tree.encode());
+            }
+        };
+    }
+
+    /**
+     * Addresses everything a scan discovers without persisting it, for {@code diff} and the
+     * dirty-working-tree check. Ids match {@link #storingSink} exactly, because both hash the same
+     * canonical envelope.
+     */
+    private static TreeSink hashingSink() {
+        return new TreeSink() {
+            @Override
+            public String blob(Path file) throws IOException {
+                return ObjectId.ofBlob(file);
+            }
+
+            @Override
+            public String symlinkTarget(byte[] target) {
+                return ObjectId.of(ObjectType.BLOB, target);
+            }
+
+            @Override
+            public String tree(Tree tree) throws IOException {
+                return ObjectId.of(ObjectType.TREE, tree.encode());
+            }
+        };
+    }
+
+    /** Where a working-tree scan sends the content it finds. */
+    private interface TreeSink {
+        String blob(Path file) throws IOException;
+
+        String symlinkTarget(byte[] target) throws IOException;
+
+        String tree(Tree tree) throws IOException;
     }
 
     private static void clearDirectory(Path directory, Path preservedChild) throws IOException {

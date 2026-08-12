@@ -3,9 +3,14 @@ package io.snapvault.cli;
 import io.snapvault.core.FileChange;
 import io.snapvault.core.Repository;
 import io.snapvault.model.CommitInfo;
+import io.snapvault.model.EntryKind;
+import io.snapvault.model.TreeEntry;
 
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.file.AccessDeniedException;
+import java.nio.file.FileSystemException;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -37,7 +42,7 @@ public final class Cli {
             err.println("Run 'snapvault help' for usage.");
             return 2;
         } catch (IOException | IllegalArgumentException exception) {
-            err.println("error: " + exception.getMessage());
+            err.println("error: " + describe(exception));
             return 1;
         }
     }
@@ -199,7 +204,9 @@ public final class Cli {
             out.println("No changes.");
         } else {
             for (FileChange change : changes) {
-                out.println(change.type().status() + "\t" + printablePath(change.path()));
+                TreeEntry entry = change.after() == null ? change.before() : change.after();
+                String suffix = entry.kind() == EntryKind.DIRECTORY ? "/" : "";
+                out.println(change.type().status() + "\t" + printablePath(change.path()) + suffix);
             }
             out.println(changes.size() + (changes.size() == 1 ? " change" : " changes"));
         }
@@ -241,6 +248,26 @@ public final class Cli {
         Path restoredTo = target == null ? repository.root() : target;
         out.println("Restored " + abbreviate(resolved) + " to " + restoredTo.toAbsolutePath().normalize());
         return 0;
+    }
+
+    /**
+     * Describes a failure in terms a person can act on. {@link FileSystemException} and its
+     * subtypes carry only the offending path as their message, which on its own prints as an
+     * unexplained path with no indication of what went wrong.
+     */
+    private static String describe(Throwable exception) {
+        if (exception instanceof AccessDeniedException denied) {
+            return "permission denied: " + denied.getFile();
+        }
+        if (exception instanceof NoSuchFileException missing) {
+            return "no such file: " + missing.getFile();
+        }
+        if (exception instanceof FileSystemException failure) {
+            String reason = failure.getReason();
+            return (reason == null ? "filesystem error" : reason.strip()) + ": " + failure.getFile();
+        }
+        String message = exception.getMessage();
+        return message == null || message.isBlank() ? exception.toString() : message;
     }
 
     private static int positiveInteger(String value, String description) throws UsageException {

@@ -9,6 +9,7 @@ This document defines the data written by SnapVault 1.x. All integer fields in b
 ├── format                 # `snapvault 1`
 ├── HEAD                   # `ref: refs/heads/main`
 ├── lock                   # process lock; contents are not significant
+├── restore-in-progress    # present only while a restore is applying; see below
 ├── objects/
 │   └── ab/cdef...         # 64-character object id split 2 + 62
 └── refs/heads/main        # current commit id, absent before first snapshot
@@ -49,6 +50,8 @@ repeat entry_count times:
 
 Directories reference tree objects. Files and symbolic links reference blob objects. Only a regular file may set the executable flag. Entry names cannot be empty, `.`, `..`, contain NUL, or contain either platform path separator.
 
+A tree with zero entries is valid and meaningful: it encodes an empty directory, which restore recreates. Because a directory's id is derived from its children, two trees are identical exactly when their files, symbolic links, and empty directories are identical, which is what lets a working-tree comparison be computed by hashing alone, without storing anything.
+
 ## Commit payload
 
 ```text
@@ -67,4 +70,6 @@ The initial commit has no parents. Normal CLI snapshots have one parent: the pri
 
 ## Restore invariants
 
-Before a restore mutates its target, SnapVault traverses the entire tree graph, validates tree structure, detects cycles, inflates every unique blob, verifies every object id, and enforces object types. Only after preflight succeeds does it clear and materialize the target. The `.snapvault` directory is preserved during an in-place restore, and restore never moves `HEAD`.
+Before a restore mutates its target, SnapVault traverses the entire tree graph, validates tree structure, detects cycles, inflates every unique blob, verifies every object id, and enforces object types. It also probes the target filesystem and refuses a snapshot whose sibling names that filesystem cannot keep apart. Only after preflight succeeds does it clear and materialize the target. The `.snapvault` directory is preserved during an in-place restore, and restore never moves `HEAD`.
+
+Clearing and materializing are many filesystem operations and cannot be made atomic as a unit. Restore therefore writes `restore-in-progress` and forces it to disk before removing anything, and deletes it only after the last entry is materialized. Its first line is the commit id being applied and its second is the absolute target path. While that file exists and names the repository root, `snapshot` and `diff` refuse to run, because the working tree is then a partial materialization rather than the user's content. Re-running the recorded restore is the recovery: it clears the target again and rewrites it in full.
