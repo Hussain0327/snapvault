@@ -1,51 +1,34 @@
 # SnapVault
 
-SnapVault brings Git-style snapshot, diff, history, and restore to any ordinary directory. It is a dependency-free Java 21 application: the directory does not need to be source code, and it does not need to be a Git repository.
+Git-style snapshots for any folder.
+Point it at a directory, take snapshots, diff them, restore any of them.
+The directory doesn't need to be code and nothing leaves your machine.
 
-Every regular file is stored as an immutable blob in a content-addressed object database. Equal content produces the same SHA-256 object id, so an unchanged file—or the same file at several paths—is written only once across all snapshots. Recursive tree objects preserve directory structure, symlinks, and executable bits. Commit objects point to a root tree and their parent commits, forming the history graph.
-
-## Quick start
-
-Requirements: JDK 21 or newer and `make`.
-
-```console
-$ make test
-$ ./snapvault init ~/Documents/my-folder
-$ ./snapvault -C ~/Documents/my-folder snapshot -m "Before reorganization"
-$ ./snapvault -C ~/Documents/my-folder log --oneline
-$ ./snapvault -C ~/Documents/my-folder diff
-$ ./snapvault -C ~/Documents/my-folder diff HEAD~1 HEAD
-$ ./snapvault -C ~/Documents/my-folder restore HEAD~1 --to /tmp/my-folder-old
-```
-
-The launcher builds `build/snapvault.jar` when needed. To build it directly:
-
-```console
-$ make jar
-$ java -jar build/snapvault.jar help
-```
-
-## Commands
+The interesting part: it's **one binary format with three implementations**
+that all read and write each other's repositories, byte for byte.
 
 ```text
-snapvault init [directory]
-snapvault [-C directory] snapshot [-m message]
-snapvault [-C directory] log [revision] [--oneline] [--limit n]
-snapvault [-C directory] diff [from [to]]
-snapvault [-C directory] restore <revision> [--to directory] [--force]
+snapvault/
+├── docs/FORMAT.md    the format spec — the contract everything follows
+├── java/             the original implementation (Java 21, zero deps)
+├── go/               full rewrite with concurrent hashing (Go, stdlib only)
+├── cpp/              snapvault-fsck, an integrity checker (C++20 + zlib)
+└── tests/interop.sh  the script that proves they actually interoperate
 ```
 
-- `init` creates `.snapvault` inside the target directory.
-- `snapshot` recursively captures the current filesystem tree, creates a commit whose parent is the current `HEAD`, and atomically advances `refs/heads/main`.
-- `log` traverses parent links in the commit graph. Revisions accept `HEAD`, a full SHA-256 id, or an unambiguous prefix of at least seven characters, each optionally followed by ancestor steps: `~` means one generation, `~N` means N, and repeated steps accumulate, so `HEAD~1~1` and `HEAD~2` name the same snapshot.
-- `diff` prints `A`, `M`, `D`, or `T` and each changed path; a trailing `/` marks a directory. With no revisions it compares `HEAD` to the working directory; with one it compares that snapshot to the working directory; with two it compares stored snapshots. `diff` never writes to the object database, so an empty change list means the two trees are byte-for-byte identical.
-- `restore` materializes an exact snapshot. By default it restores in place without moving `HEAD`. Use `--to` to export into another directory.
+I wrote the Java version first, froze the format, then rebuilt it in Go and
+wrote a C++ verifier against the same spec.
+If the spec is any good, three codebases in three languages should agree on
+every byte.
+They do, and CI checks that on every push.
 
-An in-place restore refuses to overwrite unsnapshotted work unless `--force` is present. An external target must be empty unless forced. SnapVault rejects filesystem-root, home-directory, repository-ancestor, repository-descendant, metadata-directory, and symlink restore targets.
+## How storage works
 
-Before removing a single live file, restore verifies every referenced object, inflating each blob and recomputing each id, and refuses any snapshot whose names the target filesystem cannot represent. What that preflight cannot do is make the clear-then-write itself atomic. So restore first records the commit it is applying in `.snapvault/restore-in-progress` and forces that record to disk. If the process dies partway, the record survives: `snapshot` and `diff` then refuse to run rather than treat a half-written directory as your content, and both name the command that finishes the job. Re-running that restore completes it and clears the record.
-
-## Storage model
+Every file becomes a blob in a content-addressed object store.
+Same content, same SHA-256, stored once — no matter how many paths or
+snapshots contain it.
+Trees capture directory structure (including symlinks, executable bits, and
+empty directories), and commits chain the history together.
 
 ```text
 .snapvault/HEAD
@@ -58,65 +41,103 @@ refs/heads/main ──► commit ──► parent commit ──► ...
                     /      \
                 subtree    blob
                   │          ▲
-                  └──────────┘  equal content reuses one object id
+                  └──────────┘   equal content = one object
 ```
 
-Objects use a typed canonical envelope:
+Objects are stored as `SHA-256("<type> <size>\0" + payload)`,
+zlib-compressed.
+Every read inflates the object, checks the declared size, rejects trailing
+garbage, and recomputes the digest before trusting anything.
+
+Full details and invariants: [docs/FORMAT.md](docs/FORMAT.md).
+
+## Commands
+
+The Java and Go CLIs take the same commands and print the same output:
 
 ```text
-SHA-256("<type> <payload-size>\\0" + payload)
+snapvault init [directory]
+snapvault [-C directory] snapshot [-m message]
+snapvault [-C directory] log [revision] [--oneline] [--limit n]
+snapvault [-C directory] diff [from [to]]
+snapvault [-C directory] restore <revision> [--to directory] [--force]
 ```
 
-The envelope prevents a blob, tree, and commit with the same payload bytes from colliding. It is zlib-compressed and stored at `.snapvault/objects/aa/bb...`, split after the first two hex digits. Writes go through a temporary file and an atomic move; existing ids are never duplicated. Blob ingestion and restore stream in 64 KiB chunks, so file size is not bounded by Java heap size.
+Revisions are `HEAD`, `HEAD~2`, a full id, or a 7+ character prefix.
+Restore verifies every object it needs before deleting anything, records
+what it's doing so a crash mid-restore is recoverable, and refuses targets
+that would eat your home directory or the repository itself.
 
-See [docs/FORMAT.md](docs/FORMAT.md) for the versioned binary format and repository invariants.
+## Quick start
 
-## Filesystem behavior
+```console
+$ make            # build and test all three
+$ make interop    # watch them read each other's repos
 
-SnapVault captures regular files, directories, symbolic links, and whether a regular file is executable. It does not follow symlinks. `.snapvault` at the repository root is always excluded. Sockets, devices, and named pipes are rejected instead of being silently omitted.
+$ ./java/snapvault init ~/Documents/notes
+$ go/build/snapvault -C ~/Documents/notes snapshot -m "before cleanup"
+$ ./java/snapvault -C ~/Documents/notes log --oneline
+$ cpp/build/snapvault-fsck ~/Documents/notes
+```
 
-An empty directory is part of the snapshotted state: it is stored, reported by `diff` as `A dir/` or `D dir/`, and recreated by `restore`. Once a directory has contents, only those contents are reported, because they already describe the difference.
+You need JDK 21+, Go 1.22+, CMake, a C++20 compiler, zlib, and `make`.
 
-A nested SnapVault repository's `.snapvault` directory is skipped at any depth, so snapshotting a directory that contains other repositories captures their files but not their object databases.
+## The Go rewrite: concurrent hashing
 
-Snapshots are filesystem reads rather than OS-level atomic volume snapshots. SnapVault detects a regular file whose size or modification time changes while it is being read and aborts that snapshot without advancing `HEAD`. A file rewritten in place to the same length within one filesystem timestamp tick can still slip past that check; this is the inherent limit of any mtime-based scan.
-
-## Portability
-
-Developed and tested on macOS and Linux; CI runs Linux. Symbolic links and POSIX executable bits are captured on any filesystem that supports them, and the suite skips those assertions where they are unavailable.
-
-A snapshot taken on a case-sensitive filesystem can hold two names that differ only by case, or by Unicode composition. Such a snapshot cannot be represented on macOS or Windows, where both names are one file. Restore probes the target filesystem and refuses the whole operation up front rather than silently writing one entry over the other.
-
-## Verification
-
-`make test` compiles production and test code with `--release 21`, enables all compiler lint checks, treats warnings as errors, and runs integration tests against real temporary directories. The suite covers:
-
-- deterministic SHA-256 addressing, zlib persistence, integrity checking, and deduplication;
-- recursive trees and parent-linked history, including `HEAD~N` traversal;
-- working-directory and snapshot-to-snapshot diffs;
-- dirty-work protection, exact in-place restore, and external export;
-- full object preflight before destructive restore;
-- symbolic-link round trips;
-- empty-directory add and remove, so a clean `diff` always agrees with the dirty-work check;
-- that a working-directory `diff` writes no objects;
-- chained ancestor revisions;
-- refusal of names the target filesystem cannot keep apart, before anything is written;
-- rejection of an object whose declared size is implausible, before it is buffered;
-- that a nested repository's metadata is never captured as content;
-- refusal of a restore target inside the repository;
-- that an interrupted restore blocks `snapshot` and `diff` until it is finished; and
-- the complete CLI flow from `init` through `restore`, including that a filesystem error names its cause.
-
-## Project layout
+Snapshotting is mostly hashing files, and hashing parallelizes well.
+The Go version walks the tree sequentially, then feeds every file to a
+worker pool (one worker per CPU, `--workers n` to override):
 
 ```text
-src/main/java/io/snapvault/
-├── cli/      command parsing and terminal output
-├── core/     repository, history, diff, locking, and restore
-├── hash/     SHA-256 object-id utilities
-├── model/    canonical commit and tree models
-└── store/    compressed filesystem object database
+  walk (sequential)         hash pool (concurrent)      assemble (sequential)
+┌────────────────┐         ┌──────────┐
+│ list, sort,    │  files  │ worker 1 │──┐
+│ filter entries │────────►│ worker 2 │  ├──► blob ids ──► trees ──► commit
+└────────────────┘         │   ...    │──┘
+                           └──────────┘
 ```
+
+Each worker re-checks the file's size and mtime after hashing, so a file
+rewritten mid-snapshot aborts the run instead of corrupting it.
+Trees are built bottom-up after all hashing finishes, which is why the
+resulting ids are identical no matter how many workers ran.
+
+On an M2 (240 files × 128 KiB, hash-only scan):
+
+```text
+workers=1    23.4 ms    1.3 GB/s
+workers=8     8.5 ms    3.7 GB/s
+```
+
+## The C++ verifier
+
+`snapvault-fsck <directory>` is read-only.
+It walks every ref, inflates every reachable object, recomputes every
+SHA-256, and validates tree and commit payloads against the spec.
+Corruption, truncation, or a missing object → exit 1.
+Unreachable objects or an interrupted restore → warnings, exit 0.
+
+It's stricter than the CLIs on purpose: it also rejects trees whose entries
+aren't sorted, and sorted means *UTF-16 code-unit order* (Java string
+order), which a byte-wise port silently gets wrong for characters outside
+the Basic Multilingual Plane.
+That one detail is pinned by golden test vectors generated from the Java
+implementation and shared by all three test suites.
+
+## How I know it works
+
+```text
+java writes a repo ──► go diffs it: "No changes."  go restores it: identical
+go writes a repo   ──► java diffs it: "No changes."  java restores it: identical
+same content       ──► both produce the exact same tree and blob ids
+both repos         ──► snapvault-fsck: 0 errors   corrupted copy: rejected
+```
+
+- `make test-java` — the original 16-test integration suite
+- `make test-go` — gofmt + vet + unit/integration tests, race-detector clean
+- `make test-cpp` — NIST SHA-256 vectors, golden payload parsing, and
+  integration tests against real repositories
+- `make interop` — everything in the diagram above, 18 checks
 
 ## License
 

@@ -1,4 +1,4 @@
-name: Java CI
+name: CI
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  java:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,8 +17,48 @@ jobs:
           distribution: temurin
           java-version: "21"
       - name: Compile and run integration tests
-        run: make test
-      - name: Build executable jar
-        run: make jar
-      - name: Smoke-test the packaged CLI
-        run: java -jar build/snapvault.jar --version
+        run: make test-java
+      - name: Package and smoke-test the CLI
+        run: |
+          make java
+          java -jar java/build/snapvault.jar --version
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Format check, vet, and test
+        run: make test-go
+      - name: Race-detector tests
+        run: cd go && go test -race ./...
+      - name: Concurrent hashing benchmark (informational)
+        run: cd go && go test -run '^$' -bench . -benchtime 1x ./internal/repo/
+
+  cpp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Build the Go CLI (integration-test fixture writer)
+        run: make go
+      - name: Build and test snapvault-fsck
+        run: make test-cpp
+
+  interop:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Cross-implementation interoperability suite
+        run: make interop
