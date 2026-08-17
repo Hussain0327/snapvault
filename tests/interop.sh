@@ -6,9 +6,11 @@
 #
 # Run via `make interop`, which builds all three implementations first.
 
+# TZ pins log timestamps for output comparison. LC_ALL is deliberately NOT
+# exported: a C locale makes Java decode non-ASCII filenames as ASCII on
+# Linux, breaking the café.txt fixture; sort calls pin their own locale.
 set -euo pipefail
 export TZ=UTC
-export LC_ALL=C
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly ROOT
@@ -58,7 +60,7 @@ function make_fixture() {
 function list_objects_except_commit() {
   local repo="$1"
   local commit="$2"
-  (cd "${repo}/.snapvault/objects" && find . -type f | sort) \
+  (cd "${repo}/.snapvault/objects" && find . -type f | LC_ALL=C sort) \
     | grep -v "^\./${commit:0:2}/${commit:2}$"
 }
 
