@@ -89,6 +89,9 @@ func (r *Repository) Restore(revision string, target string, force bool) error {
 	if err := r.materializeTree(commit.TreeID, resolved); err != nil {
 		return err
 	}
+	if inPlace {
+		r.removeDirCache()
+	}
 	return r.endRestore()
 }
 

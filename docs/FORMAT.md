@@ -9,6 +9,7 @@ This document defines the data written by SnapVault 1.x. All integer fields in b
 ├── format                 # `snapvault 1`
 ├── HEAD                   # `ref: refs/heads/main`
 ├── lock                   # process lock; contents are not significant
+├── cache                  # optional working-tree cache; see below
 ├── restore-in-progress    # present only while a restore is applying; see below
 ├── objects/
 │   └── ab/cdef...         # 64-character object id split 2 + 62
@@ -16,6 +17,27 @@ This document defines the data written by SnapVault 1.x. All integer fields in b
 ```
 
 Ref updates use a temporary file followed by an atomic replace when the filesystem supports it. Snapshot scanning and ref mutation hold an exclusive file lock.
+
+## Working-tree cache
+
+`.snapvault/cache` is optional. It is not part of object identity: a missing or corrupt file is treated as empty, and readers that ignore it still produce the same ids. Implementations that write it use this layout so Java and Go skip the same unchanged files.
+
+```text
+int32  magic = 0x53564443 (`SVDC`)
+int32  version = 1
+int64  written_at nanoseconds since Unix epoch
+int32  entry_count
+repeat entry_count times, sorted by Java String path order:
+    int32  UTF-8 path byte count
+    byte[] UTF-8 relative path with `/` separators
+    int64  size in bytes
+    int64  mtime nanoseconds since Unix epoch
+    int64  device id, or 0 if unknown
+    int64  inode, or 0 if unknown
+    byte[32] blob SHA-256
+```
+
+A cache hit requires the path, size, and mtime to match; the device and inode to match when both sides recorded them; the blob to still exist in the object store; and the file's mtime to be strictly older than `written_at` (the racy-clean rule). Snapshot writes a new cache after hashing. In-place restore deletes it, because `.snapvault` is otherwise preserved.
 
 ## Object envelope and id
 

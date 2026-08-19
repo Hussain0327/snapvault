@@ -152,7 +152,7 @@ func (r *Repository) Snapshot(message string) (string, error) {
 		return "", err
 	}
 
-	treeID, _, err := r.scanTree(storingSink{store: r.store})
+	treeID, _, files, err := r.scanWorking(storingSink{store: r.store})
 	if err != nil {
 		return "", err
 	}
@@ -170,6 +170,9 @@ func (r *Repository) Snapshot(message string) (string, error) {
 	}
 	commitID, err := r.store.Put(object.TypeCommit, commit.Encode())
 	if err != nil {
+		return "", err
+	}
+	if err := r.writeDirCache(files); err != nil {
 		return "", err
 	}
 	if err := r.writeCurrentRef(commitID); err != nil {
