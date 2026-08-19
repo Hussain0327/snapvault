@@ -14,6 +14,7 @@ import io.snapvault.store.StoredObject;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
@@ -25,6 +26,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.text.Normalizer;
 import java.time.Clock;
 import java.time.Instant;
@@ -44,6 +46,11 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 /** The high-level SnapVault repository API used by the CLI and tests. */
 public final class Repository {
@@ -56,12 +63,15 @@ public final class Repository {
     private final Path metadata;
     private final ObjectStore objectStore;
     private final Clock clock;
+    private final int workers;
 
-    private Repository(Path root, Path metadata, ObjectStore objectStore, Clock clock) {
+    private Repository(
+            Path root, Path metadata, ObjectStore objectStore, Clock clock, int workers) {
         this.root = root;
         this.metadata = metadata;
         this.objectStore = objectStore;
         this.clock = clock;
+        this.workers = workers;
     }
 
     /** Initializes a repository in an existing or new ordinary directory. */
@@ -102,7 +112,19 @@ public final class Repository {
 
     /** Test seam for deterministic commit timestamps. */
     public Repository withClock(Clock replacement) {
-        return new Repository(root, metadata, objectStore, Objects.requireNonNull(replacement));
+        return new Repository(
+                root, metadata, objectStore, Objects.requireNonNull(replacement), workers);
+    }
+
+    /**
+     * Bounds the hashing worker pool. {@code 0} restores the per-CPU default. The object ids a
+     * snapshot produces do not depend on the worker count.
+     */
+    public Repository withWorkers(int workerCount) {
+        if (workerCount < 0) {
+            throw new IllegalArgumentException("Worker count cannot be negative");
+        }
+        return new Repository(root, metadata, objectStore, clock, workerCount);
     }
 
     private static Repository openAt(Path root, Clock clock) throws IOException {
@@ -114,7 +136,7 @@ public final class Repository {
         }
         validateHead(metadata);
         ObjectStore store = new FileObjectStore(metadata.resolve("objects"));
-        return new Repository(realRoot, metadata, store, clock);
+        return new Repository(realRoot, metadata, store, clock, 0);
     }
 
     private static void validateHead(Path metadata) throws IOException {
@@ -143,7 +165,9 @@ public final class Repository {
         try (RepositoryLock repositoryLock = RepositoryLock.acquire(metadata.resolve("lock"))) {
             repositoryLock.ensureHeld();
             requireCompleteWorkingTree();
-            String treeId = scan(root, "", storingSink(), new TreeMap<>());
+            List<PendingEntry> files = new ArrayList<>();
+            String treeId = scan(root, "", storingSink(), new TreeMap<>(), files);
+            DirCache.write(cachePath(), toCacheEntries(files));
             Optional<String> parent = head();
             Commit commit = new Commit(
                     treeId,
@@ -446,6 +470,9 @@ public final class Repository {
             beginRestore(commitId, target);
             clearDirectory(target, inPlace ? metadata : null);
             materializeTree(commit.treeId(), target);
+            if (inPlace) {
+                Files.deleteIfExists(cachePath());
+            }
             endRestore();
         }
     }
@@ -559,7 +586,7 @@ public final class Repository {
     }
 
     private boolean isWorkingTreeDirty() throws IOException {
-        String workingTree = scan(root, "", hashingSink(), new TreeMap<>());
+        String workingTree = scan(root, "", hashingSink(), new TreeMap<>(), new ArrayList<>());
         Optional<String> current = head();
         if (current.isEmpty()) {
             return !workingTree.equals(ObjectId.of(ObjectType.TREE, new Tree(List.of()).encode()));
@@ -705,19 +732,30 @@ public final class Repository {
     /** Reads the working tree without writing anything, so diffing never grows the object store. */
     private NavigableMap<String, TreeEntry> scanWorkingTree() throws IOException {
         NavigableMap<String, TreeEntry> leaves = new TreeMap<>();
-        scan(root, "", hashingSink(), leaves);
+        scan(root, "", hashingSink(), leaves, new ArrayList<>());
         return leaves;
     }
 
     /**
-     * Walks {@code directory}, feeding what it finds to {@code sink} and recording every leaf in
-     * {@code leaves}, and returns the id of the tree object describing it.
+     * Walks {@code directory}, hashes regular files on a bounded worker pool, feeds what it finds
+     * to {@code sink}, records every leaf in {@code leaves}, and returns the id of the tree object
+     * describing it. {@code files} receives the regular-file entries so snapshot can persist a
+     * working-tree cache.
      */
     private String scan(
             Path directory,
             String prefix,
             TreeSink sink,
-            NavigableMap<String, TreeEntry> leaves)
+            NavigableMap<String, TreeEntry> leaves,
+            List<PendingEntry> files)
+            throws IOException {
+        PendingDir pending = walk(directory, prefix, sink, files);
+        hashFiles(files, sink);
+        return assemble(pending, sink, leaves);
+    }
+
+    private PendingDir walk(
+            Path directory, String prefix, TreeSink sink, List<PendingEntry> files)
             throws IOException {
         List<Path> children = new ArrayList<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(directory)) {
@@ -730,47 +768,210 @@ public final class Repository {
         }
         children.sort(Comparator.comparing(path -> path.getFileName().toString()));
 
-        List<TreeEntry> entries = new ArrayList<>();
+        PendingDir result = new PendingDir();
         for (Path child : children) {
             BasicFileAttributes before = Files.readAttributes(
                     child, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
             String name = child.getFileName().toString();
             String path = prefix.isEmpty() ? name : prefix + "/" + name;
+            PendingEntry entry = new PendingEntry();
+            entry.name = name;
+            entry.relPath = path;
+            entry.absPath = child;
             if (before.isSymbolicLink()) {
                 byte[] target = Files.readSymbolicLink(child)
                         .toString()
                         .getBytes(StandardCharsets.UTF_8);
-                TreeEntry entry =
-                        new TreeEntry(name, EntryKind.SYMLINK, sink.symlinkTarget(target), false);
-                entries.add(entry);
-                leaves.put(path, entry);
+                entry.kind = EntryKind.SYMLINK;
+                entry.objectId = sink.symlinkTarget(target);
             } else if (before.isDirectory()) {
-                int leavesBefore = leaves.size();
-                String objectId = scan(child, path, sink, leaves);
-                TreeEntry entry = new TreeEntry(name, EntryKind.DIRECTORY, objectId, false);
-                entries.add(entry);
-                if (leaves.size() == leavesBefore) {
-                    leaves.put(path, entry);
-                }
+                entry.kind = EntryKind.DIRECTORY;
+                entry.child = walk(child, path, sink, files);
             } else if (before.isRegularFile()) {
-                String objectId = sink.blob(child);
-                BasicFileAttributes after = Files.readAttributes(
-                        child, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-                if (!after.isRegularFile()
-                        || before.size() != after.size()
-                        || !before.lastModifiedTime().equals(after.lastModifiedTime())) {
-                    throw new IOException("File changed while snapshotting: " + child);
-                }
-                TreeEntry entry =
-                        new TreeEntry(name, EntryKind.FILE, objectId, Files.isExecutable(child));
-                entries.add(entry);
-                leaves.put(path, entry);
+                long[] identity = fileIdentity(child);
+                entry.kind = EntryKind.FILE;
+                entry.executable = Files.isExecutable(child);
+                entry.size = before.size();
+                entry.mtime = before.lastModifiedTime();
+                entry.mtimeNano = entry.mtime.to(TimeUnit.NANOSECONDS);
+                entry.dev = identity[0];
+                entry.ino = identity[1];
+                files.add(entry);
             } else {
                 throw new IOException("Unsupported filesystem entry: " + child);
             }
+            result.entries.add(entry);
         }
+        return result;
+    }
 
+    private void hashFiles(List<PendingEntry> files, TreeSink sink) throws IOException {
+        if (files.isEmpty()) {
+            return;
+        }
+        DirCache cache = DirCache.load(cachePath());
+        int n = workerCount(files.size());
+        if (n == 1) {
+            for (PendingEntry file : files) {
+                hashOne(file, sink, cache);
+            }
+            return;
+        }
+        ExecutorService pool = Executors.newFixedThreadPool(n);
+        try {
+            List<Future<?>> futures = new ArrayList<>(files.size());
+            for (PendingEntry file : files) {
+                futures.add(pool.submit(() -> {
+                    try {
+                        hashOne(file, sink, cache);
+                    } catch (IOException exception) {
+                        throw new UncheckedIOException(exception);
+                    }
+                }));
+            }
+            IOException first = null;
+            for (Future<?> future : futures) {
+                try {
+                    future.get();
+                } catch (InterruptedException exception) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Snapshot interrupted", exception);
+                } catch (ExecutionException exception) {
+                    Throwable cause = exception.getCause();
+                    IOException io = cause instanceof UncheckedIOException uio
+                            ? uio.getCause()
+                            : new IOException(cause);
+                    if (first == null) {
+                        first = io;
+                    }
+                }
+            }
+            if (first != null) {
+                throw first;
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private void hashOne(PendingEntry entry, TreeSink sink, DirCache cache) throws IOException {
+        String cached = cache.lookup(
+                entry.relPath,
+                entry.size,
+                entry.mtimeNano,
+                entry.dev,
+                entry.ino,
+                objectStore::contains);
+        if (cached != null) {
+            BasicFileAttributes after = Files.readAttributes(
+                    entry.absPath, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+            if (sameStat(entry, after)) {
+                entry.objectId = cached;
+                return;
+            }
+        }
+        String objectId = sink.blob(entry.absPath);
+        BasicFileAttributes after = Files.readAttributes(
+                entry.absPath, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (!sameStat(entry, after)) {
+            throw new IOException("File changed while snapshotting: " + entry.absPath);
+        }
+        entry.objectId = objectId;
+    }
+
+    private String assemble(
+            PendingDir dir, TreeSink sink, NavigableMap<String, TreeEntry> leaves)
+            throws IOException {
+        List<TreeEntry> entries = new ArrayList<>();
+        for (PendingEntry pending : dir.entries) {
+            TreeEntry entry;
+            if (pending.kind == EntryKind.DIRECTORY) {
+                int leavesBefore = leaves.size();
+                String objectId = assemble(pending.child, sink, leaves);
+                entry = new TreeEntry(pending.name, EntryKind.DIRECTORY, objectId, false);
+                if (leaves.size() == leavesBefore) {
+                    leaves.put(pending.relPath, entry);
+                }
+            } else {
+                entry = new TreeEntry(
+                        pending.name, pending.kind, pending.objectId, pending.executable);
+                leaves.put(pending.relPath, entry);
+            }
+            entries.add(entry);
+        }
         return sink.tree(new Tree(entries));
+    }
+
+    private Path cachePath() {
+        return metadata.resolve(DirCache.FILE_NAME);
+    }
+
+    private int workerCount(int fileCount) {
+        int n = workers > 0 ? workers : Runtime.getRuntime().availableProcessors();
+        return Math.max(1, Math.min(n, fileCount));
+    }
+
+    private static List<DirCache.Entry> toCacheEntries(List<PendingEntry> files) {
+        List<DirCache.Entry> entries = new ArrayList<>(files.size());
+        for (PendingEntry file : files) {
+            entries.add(new DirCache.Entry(
+                    file.relPath,
+                    file.size,
+                    file.mtimeNano,
+                    file.dev,
+                    file.ino,
+                    file.objectId));
+        }
+        return entries;
+    }
+
+    private static long[] fileIdentity(Path path) {
+        try {
+            Map<String, Object> attributes =
+                    Files.readAttributes(path, "unix:dev,ino", LinkOption.NOFOLLOW_LINKS);
+            Number dev = (Number) attributes.get("dev");
+            Number ino = (Number) attributes.get("ino");
+            return new long[] {
+                dev == null ? 0L : dev.longValue(), ino == null ? 0L : ino.longValue()
+            };
+        } catch (UnsupportedOperationException | IOException ignored) {
+            return new long[] {0L, 0L};
+        }
+    }
+
+    private static boolean sameStat(PendingEntry entry, BasicFileAttributes after) {
+        if (!after.isRegularFile()
+                || after.size() != entry.size
+                || !after.lastModifiedTime().equals(entry.mtime)) {
+            return false;
+        }
+        long[] identity = fileIdentity(entry.absPath);
+        if (entry.dev != 0 && identity[0] != 0 && entry.dev != identity[0]) {
+            return false;
+        }
+        if (entry.ino != 0 && identity[1] != 0 && entry.ino != identity[1]) {
+            return false;
+        }
+        return true;
+    }
+
+    private static final class PendingDir {
+        private final List<PendingEntry> entries = new ArrayList<>();
+    }
+
+    private static final class PendingEntry {
+        private String name;
+        private EntryKind kind;
+        private boolean executable;
+        private String objectId;
+        private PendingDir child;
+        private String relPath;
+        private Path absPath;
+        private long size;
+        private FileTime mtime;
+        private long mtimeNano;
+        private long dev;
+        private long ino;
     }
 
     /** Reports whether {@code child} is the metadata directory of a SnapVault repository. */

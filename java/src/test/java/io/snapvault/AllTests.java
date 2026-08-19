@@ -2,6 +2,7 @@ package io.snapvault;
 
 import io.snapvault.cli.Cli;
 import io.snapvault.core.ChangeType;
+import io.snapvault.core.DirCache;
 import io.snapvault.core.FileChange;
 import io.snapvault.core.Repository;
 import io.snapvault.hash.Sha256;
@@ -21,15 +22,19 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.attribute.FileTime;
+import java.nio.file.attribute.PosixFilePermission;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.zip.DeflaterOutputStream;
 
 /** Minimal dependency-free test runner used by {@code make test}. */
@@ -46,6 +51,11 @@ public final class AllTests {
     private void runAll() throws Exception {
         run("object store deduplicates and verifies SHA-256", this::objectStoreDeduplicates);
         run("snapshots form a parent-linked commit graph", this::snapshotsFormCommitGraph);
+        run(
+                "working-tree cache skips hashing unchanged files",
+                this::workingTreeCacheSkipsUnchangedFiles);
+        run("working-tree cache golden bytes round-trip", this::workingTreeCacheGoldenRoundTrips);
+        run("worker count does not change snapshot ids", this::workerCountDoesNotChangeSnapshotIds);
         run("diff reports live and snapshot changes", this::diffReportsChanges);
         run("restore protects dirty work and preserves history", this::restoreIsSafe);
         run("restore validates objects before changing files", this::restorePreflightsObjects);
@@ -135,6 +145,101 @@ public final class AllTests {
                     List.of(second, first),
                     repository.history("HEAD", 10).stream().map(info -> info.objectId()).toList(),
                     "history follows the graph in parent order");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void workingTreeCacheSkipsUnchangedFiles() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-cache-test-");
+        try {
+            Path root = temporary.resolve("work");
+            Files.createDirectories(root);
+            Path file = root.resolve("a.txt");
+            Files.writeString(file, "hello");
+            Files.setLastModifiedTime(file, FileTime.from(Instant.now().minusSeconds(2)));
+
+            Repository repository = Repository.init(root).withClock(fixed("2026-08-10T12:00:00Z"));
+            repository.snapshot("first");
+            assertTrue(
+                    Files.isRegularFile(root.resolve(".snapvault").resolve(DirCache.FILE_NAME)),
+                    "snapshot must write a working-tree cache");
+
+            Files.setPosixFilePermissions(file, Set.of());
+            repository = repository.withClock(fixed("2026-08-10T12:01:00Z"));
+            repository.snapshot("second");
+
+            Files.setPosixFilePermissions(
+                    file,
+                    Set.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE));
+            Files.writeString(file, "changed");
+            String third = repository.withClock(fixed("2026-08-10T12:02:00Z")).snapshot("third");
+            Commit thirdCommit = repository.readCommit(third);
+            String second = repository.resolveCommit("HEAD~1");
+            assertTrue(
+                    !repository.readCommit(second).treeId().equals(thirdCommit.treeId()),
+                    "content change must produce a new tree");
+
+            Path cache = root.resolve(".snapvault").resolve(DirCache.FILE_NAME);
+            Files.write(cache, "corrupt".getBytes(StandardCharsets.UTF_8));
+            repository.withClock(fixed("2026-08-10T12:03:00Z")).snapshot("after corrupt cache");
+
+            Files.writeString(file, "dirty");
+            repository.restore("HEAD", null, true);
+            assertFalse(
+                    Files.exists(root.resolve(".snapvault").resolve(DirCache.FILE_NAME)),
+                    "in-place restore must delete the cache");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void workingTreeCacheGoldenRoundTrips() throws Exception {
+        String hex = "535644430000000117979cfe362a00000000000100000005612e747874"
+                + "000000000000000317940f7f9163800000000000000000010000000000000002"
+                + "abababababababababababababababababababababababababababababababab";
+        byte[] raw = HexFormat.of().parseHex(hex);
+        byte[] encoded = DirCache.encode(
+                1_700_000_000_000_000_000L,
+                List.of(new DirCache.Entry(
+                        "a.txt",
+                        3,
+                        1_699_000_000_000_000_000L,
+                        1,
+                        2,
+                        "abababababababababababababababababababababababababababababababab")));
+        assertArrayEquals(raw, encoded, "Java encode must match the shared SVDC golden");
+        DirCache cache = DirCache.decode(raw);
+        assertEquals(
+                "abababababababababababababababababababababababababababababababab",
+                cache.lookup("a.txt", 3, 1_699_000_000_000_000_000L, 1, 2, id -> true),
+                "golden cache must look up the recorded blob id");
+    }
+
+    private void workerCountDoesNotChangeSnapshotIds() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-workers-test-");
+        try {
+            Path oneRoot = temporary.resolve("one");
+            Path eightRoot = temporary.resolve("eight");
+            Files.createDirectories(oneRoot.resolve("nested"));
+            Files.createDirectories(eightRoot.resolve("nested"));
+            Files.writeString(oneRoot.resolve("a.txt"), "alpha");
+            Files.writeString(eightRoot.resolve("a.txt"), "alpha");
+            Files.writeString(oneRoot.resolve("nested/b.txt"), "beta");
+            Files.writeString(eightRoot.resolve("nested/b.txt"), "beta");
+
+            Repository one = Repository.init(oneRoot)
+                    .withClock(fixed("2026-08-10T12:00:00Z"))
+                    .withWorkers(1);
+            Repository eight = Repository.init(eightRoot)
+                    .withClock(fixed("2026-08-10T12:00:00Z"))
+                    .withWorkers(8);
+            String oneId = one.snapshot("same");
+            String eightId = eight.snapshot("same");
+            assertEquals(
+                    one.readCommit(oneId).treeId(),
+                    eight.readCommit(eightId).treeId(),
+                    "tree id must not depend on the hashing worker count");
         } finally {
             deleteTree(temporary);
         }

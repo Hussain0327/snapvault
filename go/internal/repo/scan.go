@@ -59,6 +59,8 @@ type pendingEntry struct {
 	absPath    string
 	size       int64
 	mtime      time.Time
+	dev        uint64
+	ino        uint64
 }
 
 type pendingDir struct {
@@ -69,20 +71,25 @@ type pendingDir struct {
 // assembles tree objects bottom-up, and returns the root tree id plus every
 // leaf: files, symlinks, and directories that contain nothing.
 func (r *Repository) scanTree(snk sink) (string, map[string]object.TreeEntry, error) {
+	treeID, leaves, _, err := r.scanWorking(snk)
+	return treeID, leaves, err
+}
+
+func (r *Repository) scanWorking(snk sink) (string, map[string]object.TreeEntry, []*pendingEntry, error) {
 	var files []*pendingEntry
 	root, err := r.walk(r.root, "", snk, &files)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	if err := r.hashFiles(files, snk); err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
 	leaves := make(map[string]object.TreeEntry)
 	treeID, err := assemble(root, snk, leaves)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
-	return treeID, leaves, nil
+	return treeID, leaves, files, nil
 }
 
 func (r *Repository) walk(
@@ -137,6 +144,7 @@ func (r *Repository) walk(
 			entry.kind = object.KindFile
 			entry.executable = mode.Perm()&0o111 != 0
 			entry.size, entry.mtime = info.Size(), info.ModTime()
+			entry.dev, entry.ino = fileIdentity(info)
 			*files = append(*files, entry)
 		default:
 			return nil, fmt.Errorf("unsupported filesystem entry: %s", abs)
@@ -182,6 +190,8 @@ func (r *Repository) hashFiles(files []*pendingEntry, snk sink) error {
 		mu.Unlock()
 		once.Do(func() { close(quit) })
 	}
+	cache := loadDirCache(filepath.Join(r.metadata, cacheFileName))
+	contains := r.store.Contains
 
 	var wg sync.WaitGroup
 	for range workers {
@@ -189,7 +199,7 @@ func (r *Repository) hashFiles(files []*pendingEntry, snk sink) error {
 		go func() {
 			defer wg.Done()
 			for entry := range jobs {
-				if err := hashOne(entry, snk); err != nil {
+				if err := hashOne(entry, snk, cache, contains); err != nil {
 					fail(err)
 					return
 				}
@@ -209,14 +219,20 @@ feed:
 	return firstErr
 }
 
-func hashOne(entry *pendingEntry, snk sink) error {
+func hashOne(entry *pendingEntry, snk sink, cache *dirCache, contains func(string) bool) error {
+	if id, ok := cache.lookup(entry, contains); ok {
+		after, err := os.Lstat(entry.absPath)
+		if err == nil && sameStat(entry, after) {
+			entry.objectID = id
+			return nil
+		}
+	}
 	id, err := snk.blob(entry.absPath)
 	if err != nil {
 		return err
 	}
 	after, err := os.Lstat(entry.absPath)
-	if err != nil || !after.Mode().IsRegular() || after.Size() != entry.size ||
-		!after.ModTime().Equal(entry.mtime) {
+	if err != nil || !sameStat(entry, after) {
 		return fmt.Errorf("file changed while snapshotting: %s", entry.absPath)
 	}
 	entry.objectID = id
