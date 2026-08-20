@@ -1013,7 +1013,7 @@ void TestReadObjectRejectsDeltaChainTooDeep() {
 }
 
 void TestFsckAcceptsFormatOneAndTwo() {
-  for (const std::string& format : {"snapvault 1", "snapvault 2"}) {
+  for (const char* const format : {"snapvault 1", "snapvault 2"}) {
     const fs::path root =
         fs::temp_directory_path() / ("sv-fmt-" + NextTempSuffix());
     fs::remove_all(root);
