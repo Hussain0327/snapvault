@@ -55,7 +55,12 @@ import java.util.concurrent.TimeUnit;
 /** The high-level SnapVault repository API used by the CLI and tests. */
 public final class Repository {
     public static final String METADATA_DIRECTORY = ".snapvault";
+
+    // This CLI's writer only ever writes format 1; format 2 repositories are read-compatible
+    // (legacy zlib objects are always legal there) and differ only in the object read path, so
+    // no second write format is needed here.
     private static final String FORMAT = "snapvault 1";
+    private static final Set<String> SUPPORTED_FORMATS = Set.of("snapvault 1", "snapvault 2");
     private static final String DEFAULT_REF = "refs/heads/main";
     private static final String RESTORE_MARKER = "restore-in-progress";
 
@@ -131,11 +136,15 @@ public final class Repository {
         Path realRoot = root.toRealPath();
         Path metadata = realRoot.resolve(METADATA_DIRECTORY);
         String format = Files.readString(metadata.resolve("format")).strip();
-        if (!FORMAT.equals(format)) {
+        if (!SUPPORTED_FORMATS.contains(format)) {
             throw new IOException("Unsupported SnapVault repository format: " + format);
         }
         validateHead(metadata);
-        ObjectStore store = new FileObjectStore(metadata.resolve("objects"));
+        FileObjectStore store = new FileObjectStore(metadata.resolve("objects"));
+        // format is one of SUPPORTED_FORMATS ("snapvault 1" or "snapvault 2"), so its last
+        // character is always the version digit; the store needs it to reject a container-form
+        // object it might find in a format 1 repository (FORMAT.md, "Compatibility").
+        store.setFormat(format.charAt(format.length() - 1) - '0');
         return new Repository(realRoot, metadata, store, clock, 0);
     }
 

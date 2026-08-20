@@ -237,6 +237,34 @@ func TestContainsToleratesInvalidIDs(t *testing.T) {
 	}
 }
 
+// TestV1WriteIsByteIdentical pins the exact bytes a format 1 store writes
+// for a known payload, captured from this package before format v2 existed.
+// A store's format defaults to FormatV1, so this exercises the same code
+// path a v1 repository always has, and must never change.
+func TestV1WriteIsByteIdentical(t *testing.T) {
+	s := newTestStore(t)
+	id, err := s.Put(object.TypeBlob, []byte("hello world\n"))
+	if err != nil {
+		t.Fatalf("Put = %v", err)
+	}
+	const wantID = "0bd69098bd9b9cc5934a610ab65da429b525361147faa7b5b922919e9a23143d"
+	if id != wantID {
+		t.Fatalf("Put id = %s, want %s", id, wantID)
+	}
+	wantBytes := []byte{
+		0x78, 0x9c, 0x4a, 0xca, 0xc9, 0x4f, 0x52, 0x30, 0x34, 0x62, 0xc8, 0x48,
+		0xcd, 0xc9, 0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0xe1, 0x02, 0x04,
+		0x00, 0x00, 0xff, 0xff, 0x44, 0x11, 0x06, 0x89,
+	}
+	got, err := os.ReadFile(filepath.Join(s.dir, id[:2], id[2:]))
+	if err != nil {
+		t.Fatalf("ReadFile = %v", err)
+	}
+	if !bytes.Equal(got, wantBytes) {
+		t.Errorf("stored bytes = %#v, want %#v", got, wantBytes)
+	}
+}
+
 // writeRawObject compresses canonical bytes and places them at id's shard
 // path, bypassing Put so tests can plant malformed objects.
 func writeRawObject(t *testing.T, s *Store, id string, canonical []byte) {

@@ -177,6 +177,269 @@ else
   pass "fsck rejects a corrupted object"
 fi
 
+# ==============================================================================
+# Format v2: delta compression, zstd containers, upgrade, and repack. These
+# checks prove Go (the only v2 writer), Java (a v2 reader that keeps writing
+# legacy objects), and snapvault-fsck all agree on the new on-disk forms.
+# ==============================================================================
+
+# Prints the object id a blob file would get if stored: the hex SHA-256 of
+# the canonical envelope "blob <size>\0<content>", matching object.ID in Go.
+function blob_id_of() {
+  local file="$1"
+  local size
+  size="$(wc -c < "${file}" | tr -d ' ')"
+  { printf 'blob %s\0' "${size}"; cat "${file}"; } | shasum -a 256 \
+    | awk '{print $1}'
+}
+
+# Echoes id's on-disk object file path under repo's sharded object database.
+function object_path() {
+  local repo="$1"
+  local id="$2"
+  echo "${repo}/.snapvault/objects/${id:0:2}/${id:2}"
+}
+
+# Writes 30 slightly-different versions of a ~50 KB text file into repo,
+# snapshotting after each one with the given CLI. Mirrors the Go repack
+# package's own fixture so the same real delta savings show up here.
+# Records one "<abbreviated commit id> <blob id>" line per version to
+# versions_file, so a later check can target a specific historical version's
+# object precisely instead of guessing at the object database's layout.
+function build_versioned_document() {
+  local cli="$1"
+  local repo="$2"
+  local versions_file="$3"
+  local lines=()
+  local i
+  for ((i = 0; i < 1200; i++)); do
+    lines[i]="the quick brown fox jumps over the lazy dog"
+  done
+
+  : > "${versions_file}"
+  local seed=1
+  local v k idx output commit_abbrev
+  for ((v = 1; v <= 30; v++)); do
+    for ((k = 0; k < 5; k++)); do
+      seed=$(( (seed * 1103515245 + 12345) & 0x7fffffff ))
+      idx=$((seed % 1200))
+      lines[idx]="line ${idx} changed in version ${v} - ${seed}"
+    done
+    printf '%s\n' "${lines[@]}" > "${repo}/doc.txt"
+    output="$("${cli}" -C "${repo}" snapshot -m "version ${v}")"
+    commit_abbrev="$(printf '%s\n' "${output}" | awk '{print $2}')"
+    printf '%s %s\n' "${commit_abbrev}" "$(blob_id_of "${repo}/doc.txt")" \
+      >> "${versions_file}"
+  done
+}
+
+# Sums the actual on-disk size of every object file in repo, in bytes.
+function total_object_bytes() {
+  local repo="$1"
+  find "${repo}/.snapvault/objects" -type f -exec cat {} + | wc -c | tr -d ' '
+}
+
+# Sniffs one object file's on-disk form: "legacy" (zlib, still valid in a
+# format 2 repository), "full" (container/full), or "delta" (container/delta).
+# See docs/FORMAT.md's v2 addendum for the SVO2 envelope this reads.
+function object_form() {
+  local file="$1"
+  case "$(head -c 5 "${file}" | od -An -tx1 | tr -d ' \n')" in
+    53564f3201) echo full ;;
+    53564f3202) echo delta ;;
+    *) echo legacy ;;
+  esac
+}
+
+# Echoes "<legacy count> <full count> <delta count>" for every object file in
+# repo's object database.
+function count_object_forms() {
+  local repo="$1"
+  local legacy=0 full=0 delta=0 file
+  while IFS= read -r file; do
+    case "$(object_form "${file}")" in
+      legacy) legacy=$((legacy + 1)) ;;
+      full) full=$((full + 1)) ;;
+      delta) delta=$((delta + 1)) ;;
+    esac
+  done < <(find "${repo}/.snapvault/objects" -type f)
+  echo "${legacy} ${full} ${delta}"
+}
+
+# Scans versions_file (as written by build_versioned_document) and prints
+# the first "<commit id> <blob id>" pair whose blob is currently stored as a
+# container/delta object in repo, so a caller can restore exactly the
+# revision that depends on it. Fails if no version qualifies.
+function find_delta_version() {
+  local versions_file="$1"
+  local repo="$2"
+  local commit_abbrev blob_id
+  while read -r commit_abbrev blob_id; do
+    if [[ "$(object_form "$(object_path "${repo}" "${blob_id}")")" \
+        == "delta" ]]; then
+      echo "${commit_abbrev} ${blob_id}"
+      return 0
+    fi
+  done < "${versions_file}"
+  return 1
+}
+
+# Asserts java and go print identical `log` output for repo, reporting
+# failures with label (e.g. "over the repacked v2 repository").
+function assert_logs_match() {
+  local label="$1"
+  local repo="$2"
+  if diff <("${JAVA_CLI}" -C "${repo}" log) \
+          <("${GO_CLI}" -C "${repo}" log) > /dev/null; then
+    pass "java and go print identical logs ${label}"
+  else
+    fail "log output differs ${label}"
+  fi
+}
+
+# --- upgrade + repack a many-versions fixture: real delta savings, then
+#     cross-implementation agreement on the result. --------------------------
+
+readonly V2_REPO="${WORK}/v2-repack"
+readonly V2_VERSIONS="${WORK}/v2-versions.txt"
+mkdir -p "${V2_REPO}"
+"${GO_CLI}" init "${V2_REPO}" > /dev/null
+build_versioned_document "${GO_CLI}" "${V2_REPO}" "${V2_VERSIONS}"
+"${GO_CLI}" -C "${V2_REPO}" upgrade > /dev/null
+
+before_bytes="$(total_object_bytes "${V2_REPO}")"
+readonly before_bytes
+"${GO_CLI}" -C "${V2_REPO}" repack > /dev/null
+after_bytes="$(total_object_bytes "${V2_REPO}")"
+readonly after_bytes
+
+shrink_detail="${before_bytes} -> ${after_bytes} bytes"
+if [[ "${after_bytes}" -le $((before_bytes / 2)) ]]; then
+  pass "repack shrinks a 30-version fixture by at least 50% (${shrink_detail})"
+else
+  fail "repack shrink of a 30-version fixture is under 50% (${shrink_detail})"
+fi
+
+if [[ "$("${JAVA_CLI}" -C "${V2_REPO}" diff)" == "No changes." ]]; then
+  pass "java diff is clean over the Go-repacked v2 repository"
+else
+  fail "java diff over the Go-repacked v2 repository"
+fi
+assert_logs_match "over the repacked v2 repository" "${V2_REPO}"
+"${JAVA_CLI}" -C "${V2_REPO}" restore HEAD \
+  --to "${WORK}/java-restores-v2" > /dev/null
+if diff -r -x .snapvault "${V2_REPO}" "${WORK}/java-restores-v2" \
+    > /dev/null; then
+  pass "java restores the repacked v2 repository to a matching tree"
+else
+  fail "java restore of the repacked v2 repository differs from the tree"
+fi
+if "${FSCK}" "${V2_REPO}" > /dev/null; then
+  pass "fsck passes the repacked v2 repository"
+else
+  fail "fsck rejected the repacked v2 repository"
+fi
+
+# --- Java snapshots into the same v2 repository — legal, since it keeps
+#     writing legacy objects — leaving a mix of legacy, container-full, and
+#     container-delta objects that Go must read identically. -----------------
+
+printf 'one more version, written by java\n' >> "${V2_REPO}/doc.txt"
+"${JAVA_CLI}" -C "${V2_REPO}" snapshot -m 'java snapshot into a v2 repo' \
+  > /dev/null
+
+if [[ "$("${GO_CLI}" -C "${V2_REPO}" diff)" == "No changes." ]]; then
+  pass "go diff is clean after a java snapshot into a v2 repository"
+else
+  fail "go diff after a java snapshot into a v2 repository"
+fi
+assert_logs_match "after a java snapshot into a v2 repository" "${V2_REPO}"
+"${GO_CLI}" -C "${V2_REPO}" restore HEAD \
+  --to "${WORK}/go-restores-mixed" > /dev/null
+if diff -r -x .snapvault "${V2_REPO}" "${WORK}/go-restores-mixed" \
+    > /dev/null; then
+  pass "go restores the mixed legacy/container repository to a match"
+else
+  fail "go restore of the mixed legacy/container repository differs"
+fi
+if "${FSCK}" "${V2_REPO}" > /dev/null; then
+  pass "fsck passes the mixed legacy/container-full/container-delta repo"
+else
+  fail "fsck rejected the mixed legacy/container-full/container-delta repo"
+fi
+
+read -r legacy_count full_count delta_count \
+  < <(count_object_forms "${V2_REPO}")
+form_detail="legacy=${legacy_count} full=${full_count} delta=${delta_count}"
+if [[ "${legacy_count}" -gt 0 ]] \
+    && [[ "${full_count}" -gt 0 ]] \
+    && [[ "${delta_count}" -gt 0 ]]; then
+  pass "the mixed repository holds all three object forms (${form_detail})"
+else
+  fail "the mixed repository is missing an object form (${form_detail})"
+fi
+
+# --- Corruption rejection: a mangled container-delta object must fail fsck
+#     and be refused by restore, in both implementations. --------------------
+
+readonly V2_CORRUPT="${WORK}/v2-corrupt"
+cp -R "${V2_REPO}" "${V2_CORRUPT}"
+delta_line=""
+if ! delta_line="$(find_delta_version "${V2_VERSIONS}" "${V2_CORRUPT}")"; then
+  fail "no historical version is stored as a container-delta object"
+else
+  # delta_commit is the one snapshot whose own tree references delta_blob,
+  # so restoring exactly that revision is guaranteed to read it (restoring
+  # HEAD would not: HEAD's own blob may land on a different object).
+  read -r delta_commit delta_blob <<< "${delta_line}"
+  delta_victim="$(object_path "${V2_CORRUPT}" "${delta_blob}")"
+  # Overwrite the first 4 bytes of the zstd codec stream (past the 4-byte
+  # magic, 1-byte kind, 1-byte codec, and 32-byte base id) so the frame no
+  # longer decodes, without disturbing the header the form sniff depends on.
+  printf '\xff\xff\xff\xff' \
+    | dd of="${delta_victim}" bs=1 seek=38 count=4 conv=notrunc status=none
+  if "${FSCK}" "${V2_CORRUPT}" > /dev/null; then
+    fail "fsck accepted a repository with a corrupted delta object"
+  else
+    pass "fsck rejects a corrupted delta object"
+  fi
+  if "${GO_CLI}" -C "${V2_CORRUPT}" restore "${delta_commit}" \
+      --to "${WORK}/go-restore-corrupt" > /dev/null 2>&1; then
+    fail "go restore succeeded over a corrupted delta object"
+  else
+    pass "go restore refuses a corrupted delta object"
+  fi
+  if "${JAVA_CLI}" -C "${V2_CORRUPT}" restore "${delta_commit}" \
+      --to "${WORK}/java-restore-corrupt" > /dev/null 2>&1; then
+    fail "java restore succeeded over a corrupted delta object"
+  else
+    pass "java restore refuses a corrupted delta object"
+  fi
+fi
+
+# --- A repository claiming format 3 is rejected by all three
+#     implementations. --------------------------------------------------------
+
+readonly V3_REPO="${WORK}/v3-unsupported"
+cp -R "${V2_REPO}" "${V3_REPO}"
+printf 'snapvault 3\n' > "${V3_REPO}/.snapvault/format"
+
+if "${GO_CLI}" -C "${V3_REPO}" log > /dev/null 2>&1; then
+  fail "go accepted a format 3 repository"
+else
+  pass "go rejects a format 3 repository"
+fi
+if "${JAVA_CLI}" -C "${V3_REPO}" log > /dev/null 2>&1; then
+  fail "java accepted a format 3 repository"
+else
+  pass "java rejects a format 3 repository"
+fi
+if "${FSCK}" "${V3_REPO}" > /dev/null; then
+  fail "fsck accepted a format 3 repository"
+else
+  pass "fsck rejects a format 3 repository"
+fi
+
 # ----------------------------------------------------------------------------
 
 if [[ "${failures}" -ne 0 ]]; then

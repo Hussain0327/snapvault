@@ -2,6 +2,7 @@
 build/
 *.class
 *.jar
+java/lib/
 .idea/
 *.iml
 .DS_Store

@@ -13,12 +13,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/Hussain0327/snapvault/go/internal/object"
 	"github.com/Hussain0327/snapvault/go/internal/repo"
+	"github.com/Hussain0327/snapvault/go/internal/search"
 )
 
-const defaultLogLimit = 50
+const (
+	defaultLogLimit  = 50
+	defaultFindLimit = 5
+)
 
 // usageError reports a mistake in how the command was invoked; it exits
 // with status 2 and a pointer at the help text.
@@ -75,6 +80,14 @@ func execute(args []string, out io.Writer, workdir string) error {
 		return runDiff(out, directory, rest)
 	case "restore":
 		return runRestore(out, directory, rest)
+	case "upgrade":
+		return runUpgrade(out, directory, rest)
+	case "repack":
+		return runRepack(out, directory, rest)
+	case "index":
+		return runIndex(out, directory, rest)
+	case "find":
+		return runFind(out, directory, rest)
 	case "help", "--help", "-h":
 		if len(rest) > 0 {
 			return usageError{"help does not accept arguments"}
@@ -317,6 +330,175 @@ func runRestore(out io.Writer, directory string, args []string) error {
 	return nil
 }
 
+func runUpgrade(out io.Writer, directory string, args []string) error {
+	if len(args) > 0 {
+		return usageError{"upgrade accepts no arguments"}
+	}
+	r, err := repo.Open(directory)
+	if err != nil {
+		return err
+	}
+	upgraded, err := r.Upgrade()
+	if err != nil {
+		return err
+	}
+	if !upgraded {
+		fmt.Fprintln(out, "repository is already format 2")
+		return nil
+	}
+	fmt.Fprintln(out, "Upgraded repository to format 2")
+	return nil
+}
+
+func runRepack(out io.Writer, directory string, args []string) error {
+	dryRun := false
+	for _, arg := range args {
+		if arg != "--dry-run" {
+			return usageError{"unknown repack option: " + arg}
+		}
+		dryRun = true
+	}
+
+	r, err := repo.Open(directory)
+	if err != nil {
+		return err
+	}
+	stats, err := r.Repack(dryRun)
+	if err != nil {
+		return err
+	}
+	if stats.RewrittenObjects == 0 {
+		fmt.Fprintln(out, "nothing to repack.")
+		return nil
+	}
+
+	verb := "repacked"
+	if dryRun {
+		verb = "would repack"
+	}
+	var percent float64
+	if stats.BeforeBytes > 0 {
+		percent = float64(stats.BeforeBytes-stats.AfterBytes) / float64(stats.BeforeBytes) * 100
+	}
+	fmt.Fprintf(out, "%s %d objects: %s -> %s (%.0f%% smaller)\n",
+		verb, stats.RewrittenObjects, humanBytes(stats.BeforeBytes), humanBytes(stats.AfterBytes), percent)
+	return nil
+}
+
+func runIndex(out io.Writer, directory string, args []string) error {
+	embedderArg := "builtin"
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--embedder":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a value"}
+			}
+			embedderArg = args[i]
+		case strings.HasPrefix(arg, "--embedder="):
+			embedderArg = arg[len("--embedder="):]
+		default:
+			return usageError{"unexpected index argument: " + arg}
+		}
+	}
+	embedder, err := parseEmbedderFlag(embedderArg)
+	if err != nil {
+		return err
+	}
+
+	r, err := repo.Open(directory)
+	if err != nil {
+		return err
+	}
+	stats, err := r.Index(embedder)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "indexed %d blobs (%d chunks) with %s\n", stats.Blobs, stats.Chunks, embedder.ID())
+	if stats.Skipped > 0 {
+		fmt.Fprintf(out, "skipped %d blobs with no extractable text\n", stats.Skipped)
+	}
+	return nil
+}
+
+// parseEmbedderFlag translates an "index --embedder" value into the
+// embedder it names: "builtin" for the lexical embedder, or
+// "ollama:<model>" for a local Ollama server.
+func parseEmbedderFlag(value string) (search.Embedder, error) {
+	if value == "builtin" {
+		return search.LexicalEmbedder{}, nil
+	}
+	if model, ok := strings.CutPrefix(value, "ollama:"); ok && model != "" {
+		return search.NewOllamaEmbedder(model), nil
+	}
+	return nil, usageError{"unknown embedder: " + value}
+}
+
+func runFind(out io.Writer, directory string, args []string) error {
+	limit := defaultFindLimit
+	query := ""
+	querySet := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--limit" || arg == "-n":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a number"}
+			}
+			n, err := positiveInt(args[i], "find limit")
+			if err != nil {
+				return err
+			}
+			limit = n
+		case strings.HasPrefix(arg, "--limit="):
+			n, err := positiveInt(arg[len("--limit="):], "find limit")
+			if err != nil {
+				return err
+			}
+			limit = n
+		case strings.HasPrefix(arg, "-"):
+			return usageError{"unknown find option: " + arg}
+		case !querySet:
+			query, querySet = arg, true
+		default:
+			return usageError{"find accepts exactly one query"}
+		}
+	}
+	if !querySet || strings.TrimSpace(query) == "" {
+		return usageError{"find requires a query"}
+	}
+
+	r, err := repo.Open(directory)
+	if err != nil {
+		return err
+	}
+	results, err := r.Find(query, limit)
+	if err != nil {
+		return err
+	}
+	for _, res := range results {
+		fmt.Fprintln(out, abbreviate(res.BlobID)+"  "+res.Path+
+			"  (snapshot: \""+res.Message+"\", "+abbreviate(res.CommitID)+")")
+		fmt.Fprintln(out, "    "+printableSnippet(res.Snippet))
+	}
+	return nil
+}
+
+// humanBytes renders a byte count the way "du -h" does: whole bytes below
+// one KiB, one decimal place at KiB and above.
+func humanBytes(n int64) string {
+	if n < 1024 {
+		return strconv.FormatInt(n, 10) + " B"
+	}
+	units := []string{"KB", "MB", "GB", "TB"}
+	div, exp := int64(1024), 0
+	for scaled := n / 1024; scaled >= 1024 && exp < len(units)-1; scaled /= 1024 {
+		div *= 1024
+		exp++
+	}
+	return fmt.Sprintf("%.1f %s", float64(n)/float64(div), units[exp])
+}
+
 // describe renders a failure in terms a person can act on. Path errors
 // carry only the offending path, which on its own prints as an unexplained
 // path with no indication of what went wrong.
@@ -389,6 +571,35 @@ func printablePath(path string) string {
 	return replacer.Replace(path)
 }
 
+// printableSnippet applies printablePath's same backslash escapes to a
+// search snippet, plus a \xHH escape for any other Unicode control
+// character. Unlike a path, snippet text is lifted straight from blob
+// content, so it may carry ANSI escape sequences or other control bytes
+// that must never reach the terminal unescaped. Ordinary printable text,
+// including non-ASCII UTF-8, passes through unchanged.
+func printableSnippet(text string) string {
+	var b strings.Builder
+	for _, r := range text {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			if unicode.IsControl(r) {
+				fmt.Fprintf(&b, `\x%02x`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
 func abbreviate(id string) string {
 	return id[:12]
 }
@@ -420,6 +631,10 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "  snapvault [-C directory] log [revision] [--oneline] [--limit n]")
 	fmt.Fprintln(out, "  snapvault [-C directory] diff [from [to]]")
 	fmt.Fprintln(out, "  snapvault [-C directory] restore <revision> [--to directory] [--force]")
+	fmt.Fprintln(out, "  snapvault [-C directory] upgrade")
+	fmt.Fprintln(out, "  snapvault [-C directory] repack [--dry-run]")
+	fmt.Fprintln(out, "  snapvault [-C directory] index [--embedder builtin|ollama:<model>]")
+	fmt.Fprintln(out, "  snapvault [-C directory] find <query> [--limit n]")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Revisions can be HEAD, HEAD~N, a full SHA-256 id, or a 7+ character prefix.")
 	fmt.Fprintln(out, "With no revisions, diff compares HEAD to the working directory.")

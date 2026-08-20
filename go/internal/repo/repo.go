@@ -24,6 +24,13 @@ const (
 	formatLine    = "snapvault 1"
 	defaultRef    = "refs/heads/main"
 	restoreMarker = "restore-in-progress"
+
+	// minFormatVersion and maxFormatVersion bound the repository format
+	// versions Open accepts: 1 (legacy-only objects) and 2 (format v2
+	// containers additionally legal). Anything else is rejected with the
+	// same "unsupported SnapVault repository format" message v1 always used.
+	minFormatVersion = 1
+	maxFormatVersion = 2
 )
 
 // Repository is the high-level SnapVault API used by the CLI and tests.
@@ -31,6 +38,7 @@ type Repository struct {
 	root     string
 	metadata string
 	store    *store.Store
+	version  int
 
 	// now supplies commit timestamps; a test seam.
 	now func() time.Time
@@ -112,9 +120,9 @@ func openAt(root string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(string(format)) != formatLine {
-		return nil, fmt.Errorf(
-			"unsupported SnapVault repository format: %s", strings.TrimSpace(string(format)))
+	version, err := parseFormatVersion(string(format))
+	if err != nil {
+		return nil, err
 	}
 	if _, err := currentRefPath(metadata); err != nil {
 		return nil, err
@@ -123,7 +131,21 @@ func openAt(root string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Repository{root: realRoot, metadata: metadata, store: s, now: time.Now}, nil
+	s.SetFormat(store.Format(version))
+	return &Repository{root: realRoot, metadata: metadata, store: s, version: version, now: time.Now}, nil
+}
+
+// parseFormatVersion extracts the version number from a ".snapvault/format"
+// file's contents ("snapvault 1" or "snapvault 2"), keeping the original
+// error message shape for any other content.
+func parseFormatVersion(raw string) (int, error) {
+	line := strings.TrimSpace(raw)
+	for v := minFormatVersion; v <= maxFormatVersion; v++ {
+		if line == fmt.Sprintf("snapvault %d", v) {
+			return v, nil
+		}
+	}
+	return 0, fmt.Errorf("unsupported SnapVault repository format: %s", line)
 }
 
 // Root returns the repository's working-directory root.

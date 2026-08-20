@@ -14,9 +14,17 @@ done
 
 project_dir=$(CDPATH= cd -- "$(dirname -- "$script")" && pwd)
 jar_path="$project_dir/build/snapvault.jar"
+lib_dir="$project_dir/lib"
 
-if [ ! -f "$jar_path" ] || find "$project_dir/src/main/java" -type f -newer "$jar_path" | grep -q .; then
+# Rebuild when the jar is missing or stale, or when the pinned zstd dependency (java/lib/, see
+# `make deps`) has not been fetched yet -- `make jar` depends on `deps`, so this also repairs a
+# fresh checkout where java/lib/ does not exist.
+if [ ! -f "$jar_path" ] \
+        || find "$project_dir/src/main/java" -type f -newer "$jar_path" | grep -q . \
+        || [ -z "$(find "$lib_dir" -maxdepth 1 -name '*.jar' -print -quit 2>/dev/null)" ]; then
     make -s -C "$project_dir" jar
 fi
 
+# The jar's manifest carries a relative Class-Path to java/lib/, so `-jar` alone resolves the
+# zstd dependency without repeating it here.
 exec java -jar "$jar_path" "$@"

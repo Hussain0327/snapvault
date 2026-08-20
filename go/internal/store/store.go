@@ -1,8 +1,12 @@
 // Package store implements SnapVault's content-addressed filesystem object
-// database: format-v1 canonical envelopes, zlib-compressed on disk, sharded
-// by the first two hex digits of the object id, written through a temporary
-// file and an atomic rename. Reads verify the declared length, the absence of
-// trailing data, and the SHA-256 digest before trusting an object.
+// database: canonical envelopes sharded by the first two hex digits of the
+// object id, written through a temporary file and an atomic rename. A
+// format 1 store always writes and reads the legacy zlib envelope; a
+// format 2 store additionally reads and writes format v2 "SVO2" containers
+// (see container.go), including delta reconstruction against a base object
+// loaded through the same store. Reads verify the declared length, the
+// absence of trailing data, and the SHA-256 digest before trusting an
+// object, regardless of which on-disk form it used.
 package store
 
 import (
@@ -35,12 +39,28 @@ const (
 	maxInlinePayload = 256 << 20
 )
 
+// Format selects which on-disk object representation Put and PutBlobFile
+// write. The zero value behaves as FormatV1, so a Store returned by New
+// writes legacy bytes until SetFormat says otherwise; that is what keeps a
+// format 1 repository's writes byte-identical without New itself needing a
+// parameter every caller must pass.
+type Format int
+
+// The store formats a repository's ".snapvault/format" file can select.
+const (
+	FormatV1 Format = 1
+	FormatV2 Format = 2
+)
+
 // Store is a content-addressed object database rooted at one directory.
 type Store struct {
-	dir string
+	dir    string
+	format Format
 }
 
-// New opens (creating if needed) the object database in objectsDir.
+// New opens (creating if needed) the object database in objectsDir. The
+// returned store writes format v1 (legacy) objects until SetFormat is
+// called.
 func New(objectsDir string) (*Store, error) {
 	abs, err := filepath.Abs(objectsDir)
 	if err != nil {
@@ -50,6 +70,15 @@ func New(objectsDir string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{dir: abs}, nil
+}
+
+// SetFormat changes which on-disk representation subsequent writes use.
+// Reads are unaffected except that a container-form object (see
+// container.go) is rejected as corrupt while the store's format is
+// FormatV1, matching the rule that format v2 containers never legitimately
+// appear in a format 1 repository.
+func (s *Store) SetFormat(format Format) {
+	s.format = format
 }
 
 // Put stores an in-memory payload and returns its object id.
@@ -100,7 +129,25 @@ func BlobFileID(source string) (string, error) {
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
+// writeObject dispatches to the on-disk form the store's format calls for.
+// FormatV1 always writes the legacy envelope; FormatV2 writes format v2
+// container/full/zstd, matching "Who writes what" in the v2 design: only
+// repack (a later addition) ever writes container/delta. A payload whose
+// canonical bytes would exceed maxInlinePayload falls back to the legacy
+// form even in a FormatV2 store, since every v2 read path (unlike the
+// legacy streaming path) buffers a reconstructed object whole and enforces
+// that same cap -- container/full/zstd would otherwise write an object
+// nothing, including this store's own Get, can ever read back. Legacy is
+// legal in a format 2 repository forever, so this loses no capability.
 func (s *Store) writeObject(t object.Type, payloadSize int64, payload io.Reader) (string, error) {
+	if s.format == FormatV2 && payloadSize >= 0 &&
+		payloadSize <= maxInlinePayload-int64(len(object.Header(t, payloadSize))) {
+		return s.writeContainerFullZstd(t, payloadSize, payload)
+	}
+	return s.writeLegacy(t, payloadSize, payload)
+}
+
+func (s *Store) writeLegacy(t object.Type, payloadSize int64, payload io.Reader) (string, error) {
 	if payloadSize < 0 {
 		return "", errors.New("payload size cannot be negative")
 	}
@@ -144,26 +191,40 @@ func (s *Store) writeObject(t object.Type, payloadSize int64, payload io.Reader)
 	}
 
 	id := hex.EncodeToString(digest.Sum(nil))
-	destination, err := s.pathFor(id)
+	finalID, renamed, err := s.finalizeObject(tmpPath, id)
 	if err != nil {
 		return "", err
 	}
+	if renamed {
+		tmpPath = ""
+	}
+	return finalID, nil
+}
+
+// finalizeObject moves a fully-written temporary file into place at id's
+// shard path, deduplicating against an object already stored there. renamed
+// reports whether tmpPath was consumed, so a caller's deferred cleanup knows
+// whether there is still a temporary file to remove.
+func (s *Store) finalizeObject(tmpPath, id string) (result string, renamed bool, err error) {
+	destination, err := s.pathFor(id)
+	if err != nil {
+		return "", false, err
+	}
 	if info, err := os.Lstat(destination); err == nil {
 		if !info.Mode().IsRegular() {
-			return "", fmt.Errorf("object path is not a regular file: %s", destination)
+			return "", false, fmt.Errorf("object path is not a regular file: %s", destination)
 		}
-		return id, nil
+		return id, false, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
-		return "", err
+		return "", false, err
 	}
 	// Rename is atomic on POSIX; a concurrent writer landing first leaves
 	// identical bytes, so replacement is harmless.
 	if err := os.Rename(tmpPath, destination); err != nil {
-		return "", err
+		return "", false, err
 	}
-	tmpPath = ""
-	return id, nil
+	return id, true, nil
 }
 
 // Get reads an object whole, verifying its envelope and digest.
@@ -183,6 +244,12 @@ func (s *Store) CopyPayload(id string, expected object.Type, destination io.Writ
 	return err
 }
 
+// copyVerified reads one object, whichever on-disk form it uses, verifying
+// its envelope and digest before any of its payload reaches destination. A
+// legacy object streams straight through, matching the store's original
+// behavior exactly; a container form (full or delta) is fully reconstructed
+// in memory first by loadCanonical, since a delta's copy instructions need
+// random access into its base.
 func (s *Store) copyVerified(
 	id string, expected *object.Type, destination io.Writer, maxPayload int64,
 ) (object.Type, error) {
@@ -199,7 +266,16 @@ func (s *Store) copyVerified(
 	}
 	defer f.Close()
 
-	inflated, err := zlib.NewReader(f)
+	buffered := bufio.NewReader(f)
+	first, err := buffered.Peek(1)
+	if err != nil {
+		return 0, fmt.Errorf("object is corrupt: %s: empty object file", id)
+	}
+	if !isLegacyHeader(first[0]) {
+		return s.copyVerifiedContainer(id, expected, destination, maxPayload)
+	}
+
+	inflated, err := zlib.NewReader(buffered)
 	if err != nil {
 		return 0, fmt.Errorf("object is corrupt: %s: %w", id, err)
 	}

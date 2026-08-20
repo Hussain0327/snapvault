@@ -1,5 +1,6 @@
 package io.snapvault;
 
+import io.airlift.compress.zstd.ZstdOutputStream;
 import io.snapvault.cli.Cli;
 import io.snapvault.core.ChangeType;
 import io.snapvault.core.DirCache;
@@ -11,6 +12,8 @@ import io.snapvault.model.EntryKind;
 import io.snapvault.model.Tree;
 import io.snapvault.model.TreeEntry;
 import io.snapvault.store.FileObjectStore;
+import io.snapvault.store.GoldenDeltaVectors;
+import io.snapvault.store.ObjectId;
 import io.snapvault.store.ObjectType;
 import io.snapvault.store.StoredObject;
 
@@ -28,6 +31,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HexFormat;
@@ -70,6 +74,37 @@ public final class AllTests {
         run("restore refuses targets inside the repository", this::restoreRefusesInternalTargets);
         run("an interrupted restore blocks snapshot and diff", this::interruptedRestoreBlocksWork);
         run("CLI supports init snapshot log diff and restore", this::cliEndToEnd);
+        run("container full objects round trip through zlib", this::containerFullZlibRoundTrips);
+        run("container full objects round trip through zstd", this::containerFullZstdRoundTrips);
+        run("a delta reconstructs the FORMAT.md worked example", this::deltaWorkedExampleReconstructsTarget);
+        run("a delta copy instruction cannot read past the base", this::deltaRejectsOutOfBoundsCopy);
+        run("a delta stream cannot end mid-instruction", this::deltaRejectsTruncatedInstructions);
+        run("the reserved delta opcode 0x00 is rejected", this::deltaRejectsReservedOpcodeZero);
+        run("a delta's declared source size must match its base", this::deltaRejectsSourceSizeMismatch);
+        run("a delta's reconstructed output must match its declared target size",
+                this::deltaRejectsTargetSizeMismatch);
+        run("multi-byte varints in a delta header decode correctly", this::deltaHandlesMultiByteVarintSizes);
+        run("a delta copy size of zero means 65536 bytes", this::deltaZeroSizeCopyMeans65536Bytes);
+        run("two deltas that base off each other are rejected as a cycle", this::deltaCycleIsRejected);
+        run("a delta chain deeper than 32 hops is rejected", this::deltaChainDepthCapIsEnforced);
+        run("legacy and container objects coexist in a v2 repository",
+                this::mixedLegacyAndContainerObjectsInV2Repo);
+        run("a repository bumped to format 2 keeps working", this::formatTwoRepositoryOpens);
+        run("a malformed v2 container is rejected as corrupt", this::malformedContainerIsRejected);
+        run("a container object in a format 1 store is rejected",
+                this::containerObjectRejectedInFormatOneStore);
+        run("a repository opened at format 1 rejects container objects",
+                this::repositoryOpenedAtFormatOneRejectsContainerObjects);
+        run("a corrupt zstd container yields a corrupt-object error, not a crash",
+                this::corruptZstdContainerYieldsCorruptObjectError);
+        run("a delta against a legacy base uses its raw header bytes",
+                this::deltaAgainstLegacyBaseUsesRawHeaderBytes);
+        run("a zstd container rejects multi-frame, skippable, and trailing-garbage streams",
+                this::zstdContainerRejectsMultiFrameSkippableAndTrailingGarbage);
+        run("the shared v2 delta golden vectors all apply to their targets",
+                this::deltaGoldenVectorsApplyToTarget);
+        run("the shared v2 delta reject vectors are all refused",
+                this::deltaGoldenVectorsRejectMalformed);
         System.out.println();
         System.out.println(passed + " tests passed");
     }
@@ -429,6 +464,628 @@ public final class AllTests {
         }
     }
 
+    private void containerFullZlibRoundTrips() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-container-full-zlib-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+            byte[] payload = "container payload, stored whole".getBytes(StandardCharsets.UTF_8);
+            String objectId = ObjectId.of(ObjectType.BLOB, payload);
+            writeFullContainer(
+                    objectPath(objects, objectId), CODEC_ZLIB, canonicalBytes(ObjectType.BLOB, payload));
+
+            StoredObject restored = store.get(objectId);
+            assertEquals(ObjectType.BLOB, restored.type(), "container/full/zlib object type");
+            assertArrayEquals(payload, restored.payload(), "container/full/zlib object payload");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void containerFullZstdRoundTrips() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-container-full-zstd-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+            byte[] payload = "container payload, stored whole via zstd".getBytes(StandardCharsets.UTF_8);
+            String objectId = ObjectId.of(ObjectType.BLOB, payload);
+            writeFullContainer(
+                    objectPath(objects, objectId), CODEC_ZSTD, canonicalBytes(ObjectType.BLOB, payload));
+
+            StoredObject restored = store.get(objectId);
+            assertEquals(ObjectType.BLOB, restored.type(), "container/full/zstd object type");
+            assertArrayEquals(payload, restored.payload(), "container/full/zstd object payload");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void deltaWorkedExampleReconstructsTarget() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-delta-worked-example-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+
+            // The exact base, target, and instruction bytes from FORMAT.md's worked example.
+            byte[] basePayload = "hello world\n".getBytes(StandardCharsets.UTF_8);
+            String baseId = store.put(ObjectType.BLOB, basePayload);
+            assertEquals(
+                    "0bd69098bd9b9cc5934a610ab65da429b525361147faa7b5b922919e9a23143d",
+                    baseId,
+                    "the worked example's base id is a golden value from FORMAT.md");
+
+            byte[] instructions = {
+                0x14, 0x15, 0x08, 0x62, 0x6c, 0x6f, 0x62, 0x20, 0x31, 0x33, 0x00, (byte) 0x91, 0x08,
+                0x0b, 0x02, 0x73, 0x0a,
+            };
+            String targetId = ObjectId.of(ObjectType.BLOB, "hello worlds\n".getBytes(StandardCharsets.UTF_8));
+            writeDeltaContainer(objectPath(objects, targetId), CODEC_ZLIB, baseId, instructions);
+
+            StoredObject restored = store.get(targetId);
+            assertEquals(ObjectType.BLOB, restored.type(), "worked-example delta target type");
+            assertEquals(
+                    "hello worlds\n",
+                    new String(restored.payload(), StandardCharsets.UTF_8),
+                    "worked-example delta target payload");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void deltaRejectsOutOfBoundsCopy() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-delta-out-of-bounds-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+            byte[] basePayload = "hello world\n".getBytes(StandardCharsets.UTF_8);
+            String baseId = store.put(ObjectType.BLOB, basePayload);
+            long baseEnvelopeSize = canonicalBytes(ObjectType.BLOB, basePayload).length;
+
+            // Copies 20 bytes from a base whose canonical bytes are far shorter than that.
+            byte[] instructions = deltaInstructions(baseEnvelopeSize, 20, copyOp1(0, 20));
+            String targetId = ObjectId.of(ObjectType.BLOB, "irrelevant, never reached".getBytes(StandardCharsets.UTF_8));
+            writeDeltaContainer(objectPath(objects, targetId), CODEC_ZLIB, baseId, instructions);
+
+            assertThrows(
+                    IOException.class,
+                    () -> store.get(targetId),
+                    "a copy reaching past the base must be rejected");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void deltaRejectsTruncatedInstructions() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-delta-truncated-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+            byte[] basePayload = "hello world\n".getBytes(StandardCharsets.UTF_8);
+            String baseId = store.put(ObjectType.BLOB, basePayload);
+            long baseEnvelopeSize = canonicalBytes(ObjectType.BLOB, basePayload).length;
+
+            // An insert opcode claiming 5 literal bytes, with only 2 actually present.
+            byte[] whole = deltaInstructions(baseEnvelopeSize, 5, insertOp(new byte[] {'a', 'b', 'c', 'd', 'e'}));
+            byte[] truncated = Arrays.copyOf(whole, whole.length - 3);
+            String targetId = ObjectId.of(ObjectType.BLOB, "irrelevant, never reached".getBytes(StandardCharsets.UTF_8));
+            writeDeltaContainer(objectPath(objects, targetId), CODEC_ZLIB, baseId, truncated);
+
+            assertThrows(
+                    IOException.class,
+                    () -> store.get(targetId),
+                    "a delta stream that ends mid-instruction must be rejected");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void deltaRejectsReservedOpcodeZero() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-delta-opcode-zero-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+            byte[] basePayload = "hello world\n".getBytes(StandardCharsets.UTF_8);
+            String baseId = store.put(ObjectType.BLOB, basePayload);
+            long baseEnvelopeSize = canonicalBytes(ObjectType.BLOB, basePayload).length;
+
+            byte[] instructions = deltaInstructions(baseEnvelopeSize, 0, new byte[] {0x00});
+            String targetId = ObjectId.of(ObjectType.BLOB, "irrelevant, never reached".getBytes(StandardCharsets.UTF_8));
+            writeDeltaContainer(objectPath(objects, targetId), CODEC_ZLIB, baseId, instructions);
+
+            assertThrows(
+                    IOException.class,
+                    () -> store.get(targetId),
+                    "opcode 0x00 must always be rejected");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void deltaRejectsSourceSizeMismatch() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-delta-src-size-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+            byte[] basePayload = "hello world\n".getBytes(StandardCharsets.UTF_8);
+            String baseId = store.put(ObjectType.BLOB, basePayload);
+
+            // Declares a source size that does not match the base's actual canonical size.
+            byte[] instructions = deltaInstructions(5, 0);
+            String targetId = ObjectId.of(ObjectType.BLOB, "irrelevant, never reached".getBytes(StandardCharsets.UTF_8));
+            writeDeltaContainer(objectPath(objects, targetId), CODEC_ZLIB, baseId, instructions);
+
+            assertThrows(
+                    IOException.class,
+                    () -> store.get(targetId),
+                    "a mismatched srcSize must be rejected before any instruction runs");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void deltaRejectsTargetSizeMismatch() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-delta-tgt-size-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+            byte[] basePayload = "hello world\n".getBytes(StandardCharsets.UTF_8);
+            String baseId = store.put(ObjectType.BLOB, basePayload);
+            long baseEnvelopeSize = canonicalBytes(ObjectType.BLOB, basePayload).length;
+
+            // Declares tgtSize=5 but the instructions only ever produce 3 bytes of output.
+            byte[] instructions = deltaInstructions(baseEnvelopeSize, 5, insertOp(new byte[] {'a', 'b', 'c'}));
+            String targetId = ObjectId.of(ObjectType.BLOB, "irrelevant, never reached".getBytes(StandardCharsets.UTF_8));
+            writeDeltaContainer(objectPath(objects, targetId), CODEC_ZLIB, baseId, instructions);
+
+            assertThrows(
+                    IOException.class,
+                    () -> store.get(targetId),
+                    "output that stops short of tgtSize must be rejected");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void deltaHandlesMultiByteVarintSizes() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-delta-multibyte-varint-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+
+            // 200 bytes of payload makes both srcSize and tgtSize (209) require a two-byte varint.
+            byte[] basePayload = "x".repeat(200).getBytes(StandardCharsets.UTF_8);
+            String baseId = store.put(ObjectType.BLOB, basePayload);
+            byte[] baseEnvelope = canonicalBytes(ObjectType.BLOB, basePayload);
+
+            byte[] targetPayload = ("x".repeat(199) + "y").getBytes(StandardCharsets.UTF_8);
+            String targetId = ObjectId.of(ObjectType.BLOB, targetPayload);
+
+            // Copy everything but the base's last payload byte, then insert the replacement.
+            byte[] instructions = deltaInstructions(
+                    baseEnvelope.length,
+                    baseEnvelope.length,
+                    copyOp1(0, baseEnvelope.length - 1),
+                    insertOp(new byte[] {'y'}));
+            writeDeltaContainer(objectPath(objects, targetId), CODEC_ZLIB, baseId, instructions);
+
+            StoredObject restored = store.get(targetId);
+            assertArrayEquals(targetPayload, restored.payload(), "multi-byte-varint delta payload");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void deltaZeroSizeCopyMeans65536Bytes() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-delta-zero-size-copy-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+
+            byte[] basePayload = "x".repeat(65536).getBytes(StandardCharsets.UTF_8);
+            String baseId = store.put(ObjectType.BLOB, basePayload);
+            byte[] baseEnvelope = canonicalBytes(ObjectType.BLOB, basePayload);
+            int baseHeaderLength = baseEnvelope.length - basePayload.length;
+
+            // Target reuses the whole 65536-byte base payload, addressed via the size-omitted
+            // "0 means 65536" rule, plus one appended byte the base does not have.
+            byte[] targetPayload = new byte[basePayload.length + 1];
+            System.arraycopy(basePayload, 0, targetPayload, 0, basePayload.length);
+            targetPayload[targetPayload.length - 1] = 'y';
+            String targetId = ObjectId.of(ObjectType.BLOB, targetPayload);
+            byte[] targetHeader = canonicalHeader(ObjectType.BLOB, targetPayload.length);
+
+            byte[] instructions = deltaInstructions(
+                    baseEnvelope.length,
+                    targetHeader.length + targetPayload.length,
+                    insertOp(targetHeader),
+                    copyOpImplied65536(baseHeaderLength),
+                    insertOp(new byte[] {'y'}));
+            writeDeltaContainer(objectPath(objects, targetId), CODEC_ZLIB, baseId, instructions);
+
+            StoredObject restored = store.get(targetId);
+            assertArrayEquals(targetPayload, restored.payload(), "size-0-means-65536 delta payload");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    /**
+     * Reads the base/delta/target triples shared with the Go and C++ suites out of
+     * tests/golden/v2/delta/ (see that directory's MANIFEST.md) and asserts that applying each
+     * delta to its base reproduces its target byte for byte, so all three languages' delta
+     * decoders agree on the same fixtures.
+     */
+    private void deltaGoldenVectorsApplyToTarget() throws Exception {
+        Path goldenDir = requireGoldenDeltaDir();
+        for (String name : GOLDEN_DELTA_CASES) {
+            byte[] base = readGoldenDeltaFixture(goldenDir, name, "base");
+            byte[] delta = readGoldenDeltaFixture(goldenDir, name, "delta");
+            byte[] target = readGoldenDeltaFixture(goldenDir, name, "target");
+            byte[] got = GoldenDeltaVectors.apply(base, delta);
+            assertArrayEquals(target, got, "golden vector " + name + " must apply to its target");
+        }
+    }
+
+    /**
+     * Reads the malformed base/delta pairs shared with the Go and C++ suites out of
+     * tests/golden/v2/delta/reject/ (see that directory's MANIFEST.md) and asserts that applying
+     * each one throws, with a message naming the specific defect rather than any IOException that
+     * happened to fire.
+     */
+    private void deltaGoldenVectorsRejectMalformed() throws Exception {
+        Path rejectDir = requireGoldenDeltaRejectDir();
+        for (Map.Entry<String, String> entry : GOLDEN_DELTA_REJECT_CASES.entrySet()) {
+            String name = entry.getKey();
+            String wantSubstring = entry.getValue();
+            byte[] base = readGoldenDeltaFixture(rejectDir, name, "base");
+            byte[] delta = readGoldenDeltaFixture(rejectDir, name, "delta");
+            IOException failure = captureFailure(() -> GoldenDeltaVectors.apply(base, delta));
+            assertContains(
+                    failure.getMessage(),
+                    wantSubstring,
+                    "reject vector " + name + " must be refused for the expected reason");
+        }
+    }
+
+    private void deltaCycleIsRejected() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-delta-cycle-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+
+            // Two ids that each name the other as their delta base. Neither payload need be
+            // reachable; the cycle must be caught before any digest is even checked.
+            String idA = "a".repeat(64);
+            String idB = "b".repeat(64);
+            byte[] instructions = deltaInstructions(0, 0);
+            writeDeltaContainer(objectPath(objects, idA), CODEC_ZLIB, idB, instructions);
+            writeDeltaContainer(objectPath(objects, idB), CODEC_ZLIB, idA, instructions);
+
+            assertThrows(
+                    IOException.class,
+                    () -> store.get(idA),
+                    "two deltas basing off each other must be rejected as a cycle");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void deltaChainDepthCapIsEnforced() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-delta-depth-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+
+            // Level 0 is a legacy blob "a"; level k deltas against level k-1 by appending one more
+            // "a", so level k's payload is "a" repeated k+1 times.
+            byte[] previousPayload = "a".getBytes(StandardCharsets.UTF_8);
+            String previousId = store.put(ObjectType.BLOB, previousPayload);
+            byte[] previousEnvelope = canonicalBytes(ObjectType.BLOB, previousPayload);
+            String depthThirtyTwoId = null;
+
+            for (int level = 1; level <= 33; level++) {
+                byte[] targetPayload = "a".repeat(level + 1).getBytes(StandardCharsets.UTF_8);
+                byte[] targetHeader = canonicalHeader(ObjectType.BLOB, targetPayload.length);
+                String targetId = ObjectId.of(ObjectType.BLOB, targetPayload);
+
+                byte[] instructions = deltaInstructions(
+                        previousEnvelope.length,
+                        targetHeader.length + targetPayload.length,
+                        insertOp(targetHeader),
+                        copyOp1(previousEnvelope.length - previousPayload.length, previousPayload.length),
+                        insertOp(new byte[] {'a'}));
+                writeDeltaContainer(objectPath(objects, targetId), CODEC_ZLIB, previousId, instructions);
+
+                if (level == 32) {
+                    depthThirtyTwoId = targetId;
+                }
+                previousId = targetId;
+                previousPayload = targetPayload;
+                previousEnvelope = canonicalBytes(ObjectType.BLOB, targetPayload);
+            }
+
+            StoredObject atCap = store.get(depthThirtyTwoId);
+            assertEquals(33, atCap.payload().length, "a chain exactly 32 deltas deep must still resolve");
+
+            String depthThirtyThreeId = previousId;
+            IOException failure = captureFailure(() -> store.get(depthThirtyThreeId));
+            assertContains(failure.getMessage(), "depth", "the depth cap must name itself in the error");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void mixedLegacyAndContainerObjectsInV2Repo() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-mixed-v2-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+
+            byte[] legacyPayload = "legacy content, written the v1 way".getBytes(StandardCharsets.UTF_8);
+            String legacyId = store.put(ObjectType.BLOB, legacyPayload);
+
+            byte[] containerPayload = "container content, written the v2 way".getBytes(StandardCharsets.UTF_8);
+            String containerId = ObjectId.of(ObjectType.BLOB, containerPayload);
+            writeFullContainer(
+                    objectPath(objects, containerId),
+                    CODEC_ZLIB,
+                    canonicalBytes(ObjectType.BLOB, containerPayload));
+
+            assertArrayEquals(legacyPayload, store.get(legacyId).payload(), "the legacy object still reads");
+            assertArrayEquals(
+                    containerPayload, store.get(containerId).payload(), "the container object reads too");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void formatTwoRepositoryOpens() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-format-two-test-");
+        try {
+            Path root = temporary.resolve("repo");
+            Files.createDirectories(root);
+            Files.writeString(root.resolve("a.txt"), "hello");
+            Repository repository = Repository.init(root);
+            String commitId = repository.snapshot("v1 snapshot");
+            Files.writeString(repository.metadata().resolve("format"), "snapvault 2" + System.lineSeparator());
+
+            Repository reopened = Repository.open(root);
+            assertTrue(reopened.head().isPresent(), "a v2-format repository still sees its v1 history");
+            Files.writeString(root.resolve("a.txt"), "changed");
+            reopened.restore(commitId, null, true);
+            assertEquals(
+                    "hello",
+                    Files.readString(root.resolve("a.txt")),
+                    "a v2-format repository restores its legacy objects normally");
+
+            Files.writeString(repository.metadata().resolve("format"), "snapvault 3" + System.lineSeparator());
+            assertThrows(
+                    IOException.class,
+                    () -> Repository.open(root),
+                    "an unrecognized future format must still be rejected");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private void malformedContainerIsRejected() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-malformed-container-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+
+            String partialMagicId = "1".repeat(64);
+            Path partialMagicPath = objectPath(objects, partialMagicId);
+            Files.createDirectories(partialMagicPath.getParent());
+            Files.write(partialMagicPath, new byte[] {0x53, 0x56}); // "SV", truncated before "O2"
+            assertThrows(
+                    IOException.class,
+                    () -> store.get(partialMagicId),
+                    "a partial SVO2 magic must be rejected");
+
+            String unknownKindId = "2".repeat(64);
+            writeRawContainer(objectPath(objects, unknownKindId), 0x09, CODEC_ZLIB, new byte[0]);
+            assertThrows(
+                    IOException.class,
+                    () -> store.get(unknownKindId),
+                    "an unknown container kind byte must be rejected");
+
+            String unknownCodecId = "3".repeat(64);
+            writeRawContainer(objectPath(objects, unknownCodecId), 0x01, 0x09, new byte[0]);
+            assertThrows(
+                    IOException.class,
+                    () -> store.get(unknownCodecId),
+                    "an unknown container codec byte must be rejected");
+
+            String emptyId = "4".repeat(64);
+            Path emptyPath = objectPath(objects, emptyId);
+            Files.createDirectories(emptyPath.getParent());
+            Files.write(emptyPath, new byte[0]);
+            assertThrows(IOException.class, () -> store.get(emptyId), "an empty object file must be rejected");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    /**
+     * A container-form object is never legal in a format 1 repository (FORMAT.md, "Compatibility");
+     * Go and C++ fsck already reject one, so Java must too rather than silently decoding it.
+     */
+    private void containerObjectRejectedInFormatOneStore() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-container-in-v1-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+            store.setFormat(1);
+
+            byte[] payload = "should never appear in a format 1 repository".getBytes(StandardCharsets.UTF_8);
+            String id = ObjectId.of(ObjectType.BLOB, payload);
+            writeFullContainer(objectPath(objects, id), CODEC_ZLIB, canonicalBytes(ObjectType.BLOB, payload));
+
+            try {
+                store.get(id);
+                throw new AssertionError("a container object in a format 1 store must be rejected");
+            } catch (IOException expected) {
+                assertContains(expected.getMessage(), "format 1", "error should mention format 1");
+            }
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    /**
+     * A repository's declared format governs every store built for it, so opening one at format 1
+     * and finding a container-form object must fail the same way a directly constructed store does.
+     */
+    private void repositoryOpenedAtFormatOneRejectsContainerObjects() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-repo-format-one-container-test-");
+        try {
+            Path root = temporary.resolve("repo");
+            Files.createDirectories(root);
+            Files.writeString(root.resolve("a.txt"), "hello");
+            Repository repository = Repository.init(root);
+            repository.snapshot("v1 snapshot");
+
+            Path objects = repository.metadata().resolve("objects");
+            byte[] payload = "planted straight into a format 1 repository".getBytes(StandardCharsets.UTF_8);
+            String id = ObjectId.of(ObjectType.BLOB, payload);
+            writeFullContainer(objectPath(objects, id), CODEC_ZLIB, canonicalBytes(ObjectType.BLOB, payload));
+
+            Repository reopened = Repository.open(root);
+            try {
+                // readTree fails on the format check inside the object store before it ever gets
+                // to compare the (irrelevant here) declared type, so this exercises exactly the
+                // path a real tree or blob lookup would take.
+                reopened.readTree(id);
+                throw new AssertionError("a container object planted in a format 1 repository must be rejected");
+            } catch (IOException expected) {
+                assertContains(expected.getMessage(), "format 1", "error should mention format 1");
+            }
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    /**
+     * ZstdInputStream signals corrupt input with a RuntimeException (MalformedInputException), not
+     * an IOException; the store must still surface the usual corrupt-object IOException rather than
+     * letting it escape as an uncaught RuntimeException.
+     */
+    private void corruptZstdContainerYieldsCorruptObjectError() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-corrupt-zstd-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+
+            String id = "5".repeat(64);
+            writeRawContainer(objectPath(objects, id), 0x01, CODEC_ZSTD, new byte[] {0, 0, 0, 0});
+
+            try {
+                store.get(id);
+                throw new AssertionError("a corrupt zstd container must be rejected");
+            } catch (IOException expected) {
+                assertContains(expected.getMessage(), "corrupt", "error should say the object is corrupt");
+            }
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    /**
+     * A delta's base may itself be a legacy object whose header is not canonical (e.g. a leading
+     * zero in its declared size); the delta must be applied against the header exactly as stored,
+     * not a re-rendering built from the parsed type and integer size, since the id was computed
+     * over -- and the digest already verified -- the raw bytes.
+     */
+    private void deltaAgainstLegacyBaseUsesRawHeaderBytes() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-legacy-base-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+
+            // "blob 05\0hello": 13 raw bytes, with a non-canonical leading zero the decimal-size
+            // envelope parser accepts anyway.
+            byte[] baseCanonical = {
+                'b', 'l', 'o', 'b', ' ', '0', '5', 0x00, 'h', 'e', 'l', 'l', 'o'
+            };
+            String baseId = Sha256.hex(Sha256.newDigest().digest(baseCanonical));
+            Path basePath = objectPath(objects, baseId);
+            Files.createDirectories(basePath.getParent());
+            try (OutputStream out = Files.newOutputStream(basePath);
+                    DeflaterOutputStream deflate = new DeflaterOutputStream(out)) {
+                deflate.write(baseCanonical);
+            }
+
+            // "blob 6\0hello!": also 13 bytes, so a delta built against the raw 13-byte source
+            // reconstructs it with one insert-header, one copy-payload, and one insert-suffix
+            // instruction.
+            byte[] targetPayload = "hello!".getBytes(StandardCharsets.UTF_8);
+            byte[] targetCanonical = canonicalBytes(ObjectType.BLOB, targetPayload);
+            String targetId = ObjectId.of(ObjectType.BLOB, targetPayload);
+
+            byte[] instructions = deltaInstructions(
+                    13,
+                    13,
+                    new byte[] {0x07, 'b', 'l', 'o', 'b', ' ', '6', 0x00},
+                    new byte[] {(byte) 0x91, 0x08, 0x05},
+                    new byte[] {0x01, '!'});
+            writeDeltaContainer(objectPath(objects, targetId), CODEC_ZLIB, baseId, instructions);
+
+            assertArrayEquals(targetPayload, store.get(targetId).payload(), "delta against a raw legacy header");
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    /**
+     * FORMAT.md requires a codec-zstd stream to be exactly one standard zstd frame with no
+     * skippable frames. id is computed over the *single-frame* canonical bytes, so a rejection here
+     * can only come from framing enforcement -- a second frame or trailing bytes would also fail on
+     * a simple digest mismatch, which would mask whether framing itself is actually checked.
+     */
+    private void zstdContainerRejectsMultiFrameSkippableAndTrailingGarbage() throws Exception {
+        Path temporary = Files.createTempDirectory("snapvault-zstd-framing-test-");
+        try {
+            Path objects = temporary.resolve("objects");
+            FileObjectStore store = new FileObjectStore(objects);
+
+            byte[] payload = "hello frames".getBytes(StandardCharsets.UTF_8);
+            byte[] canonical = canonicalBytes(ObjectType.BLOB, payload);
+            String id = ObjectId.of(ObjectType.BLOB, payload);
+            byte[] frame = encode(CODEC_ZSTD, canonical);
+            byte[] skippable = {
+                0x50, 0x2a, 0x4d, 0x18, 0x04, 0x00, 0x00, 0x00, (byte) 0xde, (byte) 0xad,
+                (byte) 0xbe, (byte) 0xef
+            };
+
+            Map<String, byte[]> cases = new HashMap<>();
+            cases.put("twoFrames", concatBytes(frame, frame));
+            cases.put("trailingGarbage", concatBytes(frame, new byte[] {0x01, 0x02, 0x03}));
+            cases.put("skippableFirst", concatBytes(skippable, frame));
+
+            for (Map.Entry<String, byte[]> testCase : cases.entrySet()) {
+                Path objectFile = objectPath(objects, id);
+                Files.deleteIfExists(objectFile);
+                writeRawContainer(objectFile, 0x01, CODEC_ZSTD, testCase.getValue());
+                try {
+                    store.get(id);
+                    throw new AssertionError(testCase.getKey() + ": expected a framing rejection");
+                } catch (IOException expected) {
+                    // expected: any corrupt-object rejection is acceptable here.
+                }
+            }
+        } finally {
+            deleteTree(temporary);
+        }
+    }
+
+    private static byte[] concatBytes(byte[] first, byte[] second) {
+        byte[] joined = new byte[first.length + second.length];
+        System.arraycopy(first, 0, joined, 0, first.length);
+        System.arraycopy(second, 0, joined, first.length, second.length);
+        return joined;
+    }
+
     private void diffSeesEmptyDirectories() throws Exception {
         Path temporary = Files.createTempDirectory("snapvault-empty-directory-test-");
         try {
@@ -692,6 +1349,183 @@ public final class AllTests {
         } finally {
             deleteTree(temporary);
         }
+    }
+
+    // --- Format v2 object container fixtures -------------------------------------------------
+    //
+    // These build raw "objects/aa/<62 hex>" files by hand, the same way filesystemErrorsExplain
+    // Themselves and oversizedObjectsAreRejected already hand-build legacy object files: a v2
+    // reader must accept exactly what FORMAT.md describes, so the fixtures are assembled from
+    // that byte layout rather than through any writer.
+
+    private static final int CODEC_ZLIB = 0x01;
+    private static final int CODEC_ZSTD = 0x02;
+    private static final byte[] SVO2_MAGIC = {0x53, 0x56, 0x4f, 0x32};
+
+    // Shared cross-language v2 delta fixtures; see tests/golden/v2/delta/MANIFEST.md. Resolved
+    // relative to the working directory `make test` runs this suite from (java/), the same way
+    // go/internal/delta/golden_test.go resolves its goldenDir relative to its own package
+    // directory.
+    private static final Path GOLDEN_DELTA_DIR = Path.of("..", "tests", "golden", "v2", "delta");
+    private static final List<String> GOLDEN_DELTA_CASES = List.of(
+            "01-worked-example",
+            "02-multi-byte-varint",
+            "03-copy-65536",
+            "04-insert-chain",
+            "05-binary-content",
+            "06-mixed-edits");
+
+    // Shared cross-language v2 delta *negative* fixtures: malformed streams every decoder must
+    // refuse. Kept in their own subdirectory of GOLDEN_DELTA_DIR (a matching .base and .delta,
+    // deliberately no .target) so a reject case can never be mistaken for an accept case. The
+    // expected value is a substring DeltaApplier's IOException message must contain, so this pins
+    // *why* the stream is rejected and not just that it is.
+    private static final Path GOLDEN_DELTA_REJECT_DIR = GOLDEN_DELTA_DIR.resolve("reject");
+    private static final Map<String, String> GOLDEN_DELTA_REJECT_CASES =
+            Map.ofEntries(
+                    Map.entry("01-copy-past-end", "out of bounds"),
+                    Map.entry("02-truncated-instruction", "ends mid-instruction"),
+                    Map.entry("03-truncated-varint-header", "ends mid-instruction"),
+                    Map.entry("04-reserved-opcode-zero", "reserved opcode 0x00"),
+                    Map.entry("05-src-size-mismatch", "does not match base object size"),
+                    Map.entry("06-tgt-size-mismatch", "delta stream produced"));
+
+    private static Path requireGoldenDeltaDir() throws IOException {
+        if (!Files.isDirectory(GOLDEN_DELTA_DIR)) {
+            throw new IOException(
+                    "golden delta fixtures not found at "
+                            + GOLDEN_DELTA_DIR.toAbsolutePath()
+                            + "; run tests via `make test` (or `make -C java test`) from the repository "
+                            + "so tests/golden/v2/delta/ resolves, see that directory's MANIFEST.md");
+        }
+        return GOLDEN_DELTA_DIR;
+    }
+
+    private static Path requireGoldenDeltaRejectDir() throws IOException {
+        if (!Files.isDirectory(GOLDEN_DELTA_REJECT_DIR)) {
+            throw new IOException(
+                    "golden delta reject fixtures not found at "
+                            + GOLDEN_DELTA_REJECT_DIR.toAbsolutePath()
+                            + "; run tests via `make test` (or `make -C java test`) from the repository "
+                            + "so tests/golden/v2/delta/reject/ resolves, see that directory's MANIFEST.md");
+        }
+        return GOLDEN_DELTA_REJECT_DIR;
+    }
+
+    private static byte[] readGoldenDeltaFixture(Path goldenDir, String name, String extension)
+            throws IOException {
+        Path file = goldenDir.resolve(name + "." + extension);
+        if (!Files.isRegularFile(file)) {
+            throw new IOException("missing golden delta fixture: " + file.toAbsolutePath());
+        }
+        return Files.readAllBytes(file);
+    }
+
+    private static Path objectPath(Path objectsDirectory, String objectId) {
+        return objectsDirectory.resolve(objectId.substring(0, 2)).resolve(objectId.substring(2));
+    }
+
+    private static byte[] canonicalHeader(ObjectType type, long payloadSize) {
+        return (type.token() + " " + payloadSize + "\0").getBytes(StandardCharsets.US_ASCII);
+    }
+
+    private static byte[] canonicalBytes(ObjectType type, byte[] payload) {
+        byte[] header = canonicalHeader(type, payload.length);
+        byte[] envelope = new byte[header.length + payload.length];
+        System.arraycopy(header, 0, envelope, 0, header.length);
+        System.arraycopy(payload, 0, envelope, header.length, payload.length);
+        return envelope;
+    }
+
+    private static byte[] encode(int codec, byte[] raw) throws IOException {
+        ByteArrayOutputStream encoded = new ByteArrayOutputStream();
+        if (codec == CODEC_ZSTD) {
+            try (ZstdOutputStream zstd = new ZstdOutputStream(encoded)) {
+                zstd.write(raw);
+            }
+        } else {
+            try (DeflaterOutputStream deflate = new DeflaterOutputStream(encoded)) {
+                deflate.write(raw);
+            }
+        }
+        return encoded.toByteArray();
+    }
+
+    private static void writeFullContainer(Path objectFile, int codec, byte[] canonicalBytes)
+            throws IOException {
+        writeRawContainer(objectFile, 0x01, codec, encode(codec, canonicalBytes));
+    }
+
+    private static void writeDeltaContainer(
+            Path objectFile, int codec, String baseObjectId, byte[] instructions) throws IOException {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        body.writeBytes(Sha256.bytes(baseObjectId));
+        body.writeBytes(encode(codec, instructions));
+        writeRawContainer(objectFile, 0x02, codec, body.toByteArray());
+    }
+
+    /** Writes a container with whatever kind/codec bytes and body the caller supplies, valid or not. */
+    private static void writeRawContainer(Path objectFile, int kind, int codec, byte[] body)
+            throws IOException {
+        Files.createDirectories(objectFile.getParent());
+        try (OutputStream out = Files.newOutputStream(objectFile)) {
+            out.write(SVO2_MAGIC);
+            out.write(kind);
+            out.write(codec);
+            out.write(body);
+        }
+    }
+
+    /** Assembles a delta instruction stream: the srcSize/tgtSize varint header, then each op's bytes. */
+    private static byte[] deltaInstructions(long sourceSize, long targetSize, byte[]... ops)
+            throws IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        writeVarint(out, sourceSize);
+        writeVarint(out, targetSize);
+        for (byte[] op : ops) {
+            out.writeBytes(op);
+        }
+        return out.toByteArray();
+    }
+
+    private static void writeVarint(ByteArrayOutputStream out, long value) {
+        long remaining = value;
+        while (true) {
+            int sevenBits = (int) (remaining & 0x7f);
+            remaining >>>= 7;
+            if (remaining == 0) {
+                out.write(sevenBits);
+                return;
+            }
+            out.write(sevenBits | 0x80);
+        }
+    }
+
+    /** An insert opcode (1..127) carrying its literal bytes. */
+    private static byte[] insertOp(byte[] literal) {
+        byte[] op = new byte[1 + literal.length];
+        op[0] = (byte) literal.length;
+        System.arraycopy(literal, 0, op, 1, literal.length);
+        return op;
+    }
+
+    /** A copy opcode with a one-byte offset (0..255) and a one-byte size (1..255). */
+    private static byte[] copyOp1(int offset, int size) {
+        return new byte[] {(byte) 0x91, (byte) offset, (byte) size};
+    }
+
+    /** A copy opcode with a one-byte offset (0..255) and the size omitted, meaning 65536. */
+    private static byte[] copyOpImplied65536(int offset) {
+        return new byte[] {(byte) 0x81, (byte) offset};
+    }
+
+    private static IOException captureFailure(ThrowingRunnable action) throws Exception {
+        try {
+            action.run();
+        } catch (IOException exception) {
+            return exception;
+        }
+        throw new AssertionError("expected an IOException");
     }
 
     private static boolean isCaseSensitive(Path directory) throws IOException {

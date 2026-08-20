@@ -16,6 +16,14 @@
 namespace snapvault {
 namespace {
 
+// The deepest a tree may nest before CheckTree reports an error instead of
+// recursing further. Real repositories mirror an ordinary filesystem's
+// directory nesting, which never comes close to this; the cap exists so a
+// maliciously deep tree graph is rejected with a clear error instead of
+// exhausting the C call stack (see kMaxDeltaChainDepth in object_store.h
+// for the same pattern applied to delta chains).
+constexpr int kMaxTreeDepth = 1000;
+
 std::string Trim(const std::string& s) {
   size_t begin = 0;
   size_t end = s.size();
@@ -78,8 +86,15 @@ class Checker {
     std::string format;
     if (!ReadTextFile(metadata_ / "format", &format)) {
       Error("repository format file is missing or unreadable");
-    } else if (Trim(format) != "snapvault 1") {
-      Error("unsupported repository format: " + Trim(format));
+    } else {
+      const std::string trimmed = Trim(format);
+      if (trimmed == "snapvault 1") {
+        format_version_ = 1;
+      } else if (trimmed == "snapvault 2") {
+        format_version_ = 2;
+      } else {
+        Error("unsupported repository format: " + trimmed);
+      }
     }
     std::string head;
     if (!ReadTextFile(metadata_ / "HEAD", &head)) {
@@ -163,16 +178,22 @@ class Checker {
         continue;
       }
       std::set<std::string> stack;
-      CheckTree(commit.tree_id, &stack);
+      CheckTree(commit.tree_id, &stack, /*depth=*/0);
       for (const std::string& parent : commit.parents) {
         pending.push_back(parent);
       }
     }
   }
 
-  void CheckTree(const std::string& id, std::set<std::string>* stack) {
+  void CheckTree(const std::string& id, std::set<std::string>* stack,
+                 int depth) {
     reachable_.insert(id);
     if (ok_trees_.count(id) != 0) {
+      return;
+    }
+    if (depth > kMaxTreeDepth) {
+      Error("tree depth exceeds the maximum of " +
+            std::to_string(kMaxTreeDepth) + " at " + id);
       return;
     }
     if (!stack->insert(id).second) {
@@ -191,7 +212,7 @@ class Checker {
         } else {
           for (const TreeEntry& entry : entries) {
             if (entry.kind == kKindDirectory) {
-              CheckTree(entry.object_id, stack);
+              CheckTree(entry.object_id, stack, depth + 1);
             } else {
               CheckBlob(entry.object_id);
             }
@@ -236,6 +257,10 @@ class Checker {
     checked_[id] = ok;
     if (ok) {
       types_[id] = info.type;
+      if (format_version_ == 1 && info.form != ObjectForm::kLegacy) {
+        Error("container-form object found in a format 1 repository: " +
+              id);
+      }
     } else {
       Error(error);
     }
@@ -278,6 +303,10 @@ class Checker {
   const std::filesystem::path metadata_;
   const std::filesystem::path objects_;
   std::ostream& out_;
+  // 0 until CheckLayout parses a recognized format line; an unrecognized
+  // format is already reported there, and format-specific checks below
+  // simply have nothing to enforce while it stays 0.
+  int format_version_ = 0;
   int errors_ = 0;
   int warnings_ = 0;
   std::set<std::string> reachable_;
