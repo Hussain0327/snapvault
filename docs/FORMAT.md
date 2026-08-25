@@ -296,6 +296,14 @@ digest, or reachability rule depends on its presence, contents, or absence,
 and a verifier such as fsck ignores it entirely. Deleting it loses nothing
 but the index; rebuilding it never rewrites an object.
 
+The index file itself, `.snapvault/index/embeddings.svi`, is the SVX2
+format: a hybrid dense-and-lexical retrieval index (a per-chunk embedding
+vector plus BM25 term frequencies) defined and versioned entirely within
+`go/internal/search`, independent of and unrelated to the object store's
+own format v1/v2 versioning above. Its shape may change across SnapVault
+releases without a format bump here, since, as above, fsck and every
+normative invariant in this document ignore it completely.
+
 ## Restore invariants
 
 Before a restore mutates its target, SnapVault traverses the entire tree

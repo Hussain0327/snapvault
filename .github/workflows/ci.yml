@@ -51,6 +51,40 @@ jobs:
       - name: Build and test snapvault-fsck
         run: make test-cpp
 
+  eval:
+    runs-on: ubuntu-latest
+    env:
+      # Pinned so the actions/cache path below is exact, rather than
+      # depending on os.UserCacheDir()'s resolution on the runner.
+      SNAPVAULT_MODEL_DIR: ${{ github.workspace }}/.snapvault-models
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Cache the potion-base-8M model
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SNAPVAULT_MODEL_DIR }}/potion-base-8M
+          # Keyed on the pinned revision in
+          # go/internal/model2vec/registry.go, Registry["potion-base-8M"].Revision.
+          # Bump this key whenever that commit hash changes.
+          key: potion-base-8M-bf8b056651a2c21b8d2565580b8569da283cab23
+      - name: Build the Go CLI
+        run: make go
+      - name: Pull the static embedding model (skipped once the cache has it)
+        run: |
+          ./go/build/snapvault model list | grep -q "potion-base-8M  installed" \
+            || ./go/build/snapvault model pull potion-base-8M
+      - name: Search-eval unit tests (model required, not skipped)
+        run: cd go && SNAPVAULT_REQUIRE_MODEL=1 go test ./internal/eval/
+      # `make eval` prints both embedders' tables for the job log; it fails
+      # only if the CLI itself errors. The quality floor is enforced by the
+      # step above: TestGoldenFloorLexical/TestGoldenFloorStatic compare
+      # FBeta@10 against tests/golden/search/baseline.json.
+      - name: Golden search-eval scoreboard, both embedders
+        run: make eval
+
   interop:
     runs-on: ubuntu-latest
     steps:

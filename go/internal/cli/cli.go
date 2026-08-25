@@ -4,17 +4,21 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode"
 
+	"github.com/Hussain0327/snapvault/go/internal/eval"
+	"github.com/Hussain0327/snapvault/go/internal/model2vec"
 	"github.com/Hussain0327/snapvault/go/internal/object"
 	"github.com/Hussain0327/snapvault/go/internal/repo"
 	"github.com/Hussain0327/snapvault/go/internal/search"
@@ -23,7 +27,30 @@ import (
 const (
 	defaultLogLimit  = 50
 	defaultFindLimit = 5
+
+	// defaultStaticModel is what "--embedder static", with no explicit
+	// model name, resolves to.
+	defaultStaticModel = "potion-base-8M"
+
+	// defaultEvalK and defaultEvalBeta are "eval run"'s -k and --beta
+	// defaults, matching the eval spec's Aggregate defaults exactly so an
+	// unqualified "eval run" reports the same headline metric
+	// (fbeta@10) that tests/golden/search/baseline.json pins.
+	defaultEvalK    = 10
+	defaultEvalBeta = 2.0
+	// defaultEvalPct is "eval run"'s --pct default: evaluate every question.
+	defaultEvalPct = 100
+	// defaultEvalPerFile is "eval generate"'s --per-file default.
+	defaultEvalPerFile = 2
 )
+
+// evalOllamaBaseURL is the local Ollama server "eval generate" talks to.
+// It is a package-level var, not a constant, purely so cli_test.go can
+// redirect it at an httptest.Server for TestEvalGenerateAgainstHTTPTestServer
+// — the spec's CLI surface has no --base-url flag for eval generate (every
+// other Ollama-backed command hardcodes localhost too), so there is no
+// flag-driven way to point it elsewhere.
+var evalOllamaBaseURL = "http://localhost:11434"
 
 // usageError reports a mistake in how the command was invoked; it exits
 // with status 2 and a pointer at the help text.
@@ -35,7 +62,7 @@ func (e usageError) Error() string { return e.message }
 
 // Run executes one CLI invocation and returns its exit code.
 func Run(args []string, out, errOut io.Writer, workdir string) int {
-	err := execute(args, out, workdir)
+	err := execute(args, out, errOut, workdir)
 	if err == nil {
 		return 0
 	}
@@ -49,7 +76,7 @@ func Run(args []string, out, errOut io.Writer, workdir string) int {
 	return 1
 }
 
-func execute(args []string, out io.Writer, workdir string) error {
+func execute(args []string, out, errOut io.Writer, workdir string) error {
 	directory, err := filepath.Abs(workdir)
 	if err != nil {
 		return err
@@ -87,7 +114,11 @@ func execute(args []string, out io.Writer, workdir string) error {
 	case "index":
 		return runIndex(out, directory, rest)
 	case "find":
-		return runFind(out, directory, rest)
+		return runFind(out, errOut, directory, rest)
+	case "model":
+		return runModel(out, errOut, rest)
+	case "eval":
+		return runEval(out, errOut, directory, rest)
 	case "help", "--help", "-h":
 		if len(rest) > 0 {
 			return usageError{"help does not accept arguments"}
@@ -410,7 +441,7 @@ func runIndex(out io.Writer, directory string, args []string) error {
 	if err != nil {
 		return err
 	}
-	stats, err := r.Index(embedder)
+	stats, err := r.Index(embedder, search.DefaultPipeline())
 	if err != nil {
 		return err
 	}
@@ -422,11 +453,19 @@ func runIndex(out io.Writer, directory string, args []string) error {
 }
 
 // parseEmbedderFlag translates an "index --embedder" value into the
-// embedder it names: "builtin" for the lexical embedder, or
-// "ollama:<model>" for a local Ollama server.
+// embedder it names: "builtin" for the lexical embedder, "static" or
+// "static:<name>" for a locally installed Model2Vec model (bare "static" is
+// an alias for defaultStaticModel), or "ollama:<model>" for a local Ollama
+// server.
 func parseEmbedderFlag(value string) (search.Embedder, error) {
 	if value == "builtin" {
 		return search.LexicalEmbedder{}, nil
+	}
+	if value == "static" {
+		value = "static:" + defaultStaticModel
+	}
+	if name, ok := strings.CutPrefix(value, "static:"); ok && name != "" {
+		return search.NewStaticEmbedder(name)
 	}
 	if model, ok := strings.CutPrefix(value, "ollama:"); ok && model != "" {
 		return search.NewOllamaEmbedder(model), nil
@@ -434,7 +473,7 @@ func parseEmbedderFlag(value string) (search.Embedder, error) {
 	return nil, usageError{"unknown embedder: " + value}
 }
 
-func runFind(out io.Writer, directory string, args []string) error {
+func runFind(out, errOut io.Writer, directory string, args []string) error {
 	limit := defaultFindLimit
 	query := ""
 	querySet := false
@@ -472,7 +511,18 @@ func runFind(out io.Writer, directory string, args []string) error {
 	if err != nil {
 		return err
 	}
-	results, err := r.Find(query, limit)
+	p := search.DefaultPipeline()
+	s, err := r.OpenSearcher(p)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	if s.IndexHash() != p.IndexHash() {
+		fmt.Fprintln(errOut,
+			"note: index was built with different chunking settings; run 'snapvault index' to rebuild")
+	}
+
+	results, err := s.Find(query, limit)
 	if err != nil {
 		return err
 	}
@@ -482,6 +532,323 @@ func runFind(out io.Writer, directory string, args []string) error {
 		fmt.Fprintln(out, "    "+printableSnippet(res.Snippet))
 	}
 	return nil
+}
+
+// runModel dispatches "model pull <name>" and "model list".
+func runModel(out, errOut io.Writer, args []string) error {
+	if len(args) == 0 {
+		return usageError{"model requires a subcommand: pull or list"}
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "pull":
+		return runModelPull(errOut, rest)
+	case "list":
+		return runModelList(out, rest)
+	default:
+		return usageError{"unknown model subcommand: " + sub}
+	}
+}
+
+// runModelPull downloads a registered model's files, streaming progress to
+// errOut. It is the only code path in the CLI that opens a network
+// connection.
+func runModelPull(errOut io.Writer, args []string) error {
+	if len(args) != 1 {
+		return usageError{"model pull requires exactly one model name"}
+	}
+	name := args[0]
+	spec, ok := model2vec.Registry[name]
+	if !ok {
+		return usageError{"unknown model: " + name}
+	}
+	dir, err := model2vec.Dir(name)
+	if err != nil {
+		return err
+	}
+	if err := model2vec.Pull(context.Background(), spec, "", dir, errOut); err != nil {
+		return err
+	}
+	fmt.Fprintf(errOut, "installed %s in %s\n", name, dir)
+	return nil
+}
+
+// runModelList prints every registered model's install status: installed,
+// not installed, or corrupt (present but failing model2vec.Verify), and the
+// directory it lives in or would be installed into.
+func runModelList(out io.Writer, args []string) error {
+	if len(args) > 0 {
+		return usageError{"model list accepts no arguments"}
+	}
+	names := make([]string, 0, len(model2vec.Registry))
+	for name := range model2vec.Registry {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, name := range names {
+		spec := model2vec.Registry[name]
+		dir, err := model2vec.Dir(name)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "%s  %s  %s\n", name, modelStatus(spec, dir), dir)
+	}
+	return nil
+}
+
+// modelStatus reports whether spec's files are installed, absent
+// (not installed), or present but failing verification (corrupt).
+func modelStatus(spec model2vec.Spec, dir string) string {
+	if err := model2vec.Verify(spec, dir); err == nil {
+		return "installed"
+	}
+	for _, f := range spec.Files {
+		if _, err := os.Stat(filepath.Join(dir, f.Name)); err != nil {
+			return "not installed"
+		}
+	}
+	return "corrupt"
+}
+
+// runEval dispatches "eval run" and "eval generate".
+func runEval(out, errOut io.Writer, directory string, args []string) error {
+	if len(args) == 0 {
+		return usageError{"eval requires a subcommand: run or generate"}
+	}
+	sub, rest := args[0], args[1:]
+	switch sub {
+	case "run":
+		return runEvalRun(out, directory, rest)
+	case "generate":
+		return runEvalGenerate(errOut, directory, rest)
+	default:
+		return usageError{"unknown eval subcommand: " + sub}
+	}
+}
+
+// runEvalRun implements "eval run --questions <file> [--corpus <dir>]
+// [--embedder X] [-k n] [--beta f] [--pct n] [--json]": it loads and
+// samples the question file, opens or builds the repository to evaluate
+// against, and prints eval.Run's Report as a table or, with --json, as
+// indented JSON.
+func runEvalRun(out io.Writer, directory string, args []string) error {
+	questionsPath := ""
+	corpusDir := ""
+	embedderArg := "builtin"
+	k := defaultEvalK
+	beta := defaultEvalBeta
+	pct := defaultEvalPct
+	jsonOut := false
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--questions":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a value"}
+			}
+			questionsPath = args[i]
+		case strings.HasPrefix(arg, "--questions="):
+			questionsPath = arg[len("--questions="):]
+		case arg == "--corpus":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a value"}
+			}
+			corpusDir = args[i]
+		case strings.HasPrefix(arg, "--corpus="):
+			corpusDir = arg[len("--corpus="):]
+		case arg == "--embedder":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a value"}
+			}
+			embedderArg = args[i]
+		case strings.HasPrefix(arg, "--embedder="):
+			embedderArg = arg[len("--embedder="):]
+		case arg == "-k" || arg == "--k":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a number"}
+			}
+			n, err := positiveInt(args[i], "eval k")
+			if err != nil {
+				return err
+			}
+			k = n
+		case strings.HasPrefix(arg, "--k="):
+			n, err := positiveInt(arg[len("--k="):], "eval k")
+			if err != nil {
+				return err
+			}
+			k = n
+		case arg == "--beta":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a number"}
+			}
+			b, err := positiveFloat(args[i], "eval beta")
+			if err != nil {
+				return err
+			}
+			beta = b
+		case strings.HasPrefix(arg, "--beta="):
+			b, err := positiveFloat(arg[len("--beta="):], "eval beta")
+			if err != nil {
+				return err
+			}
+			beta = b
+		case arg == "--pct":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a number"}
+			}
+			n, err := evalPct(args[i])
+			if err != nil {
+				return err
+			}
+			pct = n
+		case strings.HasPrefix(arg, "--pct="):
+			n, err := evalPct(arg[len("--pct="):])
+			if err != nil {
+				return err
+			}
+			pct = n
+		case arg == "--json":
+			jsonOut = true
+		default:
+			return usageError{"unexpected eval run argument: " + arg}
+		}
+	}
+	if questionsPath == "" {
+		return usageError{"eval run requires --questions"}
+	}
+	embedder, err := parseEmbedderFlag(embedderArg)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Open(resolve(directory, questionsPath))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	qs, err := eval.LoadQuestions(f)
+	if err != nil {
+		return err
+	}
+	qs = eval.Sample(qs, pct)
+
+	p := search.DefaultPipeline()
+	var r *repo.Repository
+	if corpusDir != "" {
+		_, corpusRepo, cleanup, err := eval.BuildCorpusRepo(resolve(directory, corpusDir))
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+		if _, err := corpusRepo.Index(embedder, p); err != nil {
+			return err
+		}
+		r = corpusRepo
+	} else {
+		r, err = repo.Open(directory)
+		if err != nil {
+			return err
+		}
+	}
+
+	report, err := eval.Run(context.Background(), r, p, embedder, qs, k, beta)
+	if err != nil {
+		return err
+	}
+	if jsonOut {
+		return report.WriteJSON(out)
+	}
+	report.WriteTable(out)
+	return nil
+}
+
+// runEvalGenerate implements "eval generate --model <ollama-model> --out
+// <file> [--per-file n]": it opens the repository at directory, walks its
+// HEAD text blobs through eval.Generate, and writes the resulting question
+// file to --out.
+func runEvalGenerate(errOut io.Writer, directory string, args []string) error {
+	model := ""
+	outPath := ""
+	perFile := defaultEvalPerFile
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--model":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a value"}
+			}
+			model = args[i]
+		case strings.HasPrefix(arg, "--model="):
+			model = arg[len("--model="):]
+		case arg == "--out":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a value"}
+			}
+			outPath = args[i]
+		case strings.HasPrefix(arg, "--out="):
+			outPath = arg[len("--out="):]
+		case arg == "--per-file":
+			if i++; i >= len(args) {
+				return usageError{arg + " requires a number"}
+			}
+			n, err := positiveInt(args[i], "eval generate --per-file")
+			if err != nil {
+				return err
+			}
+			perFile = n
+		case strings.HasPrefix(arg, "--per-file="):
+			n, err := positiveInt(arg[len("--per-file="):], "eval generate --per-file")
+			if err != nil {
+				return err
+			}
+			perFile = n
+		default:
+			return usageError{"unexpected eval generate argument: " + arg}
+		}
+	}
+	if model == "" {
+		return usageError{"eval generate requires --model"}
+	}
+	if outPath == "" {
+		return usageError{"eval generate requires --out"}
+	}
+
+	r, err := repo.Open(directory)
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Create(resolve(directory, outPath))
+	if err != nil {
+		return err
+	}
+	written, dropped, genErr := eval.Generate(context.Background(), r, evalOllamaBaseURL, model, perFile, f)
+	closeErr := f.Close()
+	if genErr != nil {
+		return genErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	fmt.Fprintf(errOut, "wrote %d question(s) to %s (%d dropped)\n", written, outPath, dropped)
+	return nil
+}
+
+// positiveFloat parses value as a positive float64, or a usage error naming
+// description.
+func positiveFloat(value string, description string) (float64, error) {
+	f, err := strconv.ParseFloat(value, 64)
+	if err != nil {
+		return 0, usageError{description + " must be a number"}
+	}
+	if f <= 0 {
+		return 0, usageError{description + " must be positive"}
+	}
+	return f, nil
 }
 
 // humanBytes renders a byte count the way "du -h" does: whole bytes below
@@ -604,6 +971,22 @@ func abbreviate(id string) string {
 	return id[:12]
 }
 
+// evalPct parses value as "eval run"'s --pct: an integer in [1, 100].
+// Unlike -k and --beta (positiveInt, positiveFloat), a bare strconv.Atoi
+// here used to silently accept 0 or a negative number and run every
+// question, exactly as pct=100 does, with no indication the flag was
+// ignored; this makes --pct fail the same way its sibling flags do instead.
+func evalPct(value string) (int, error) {
+	n, err := positiveInt(value, "eval pct")
+	if err != nil {
+		return 0, err
+	}
+	if n > 100 {
+		return 0, usageError{"eval pct must be at most 100"}
+	}
+	return n, nil
+}
+
 func positiveInt(value string, description string) (int, error) {
 	n, err := strconv.Atoi(value)
 	if err != nil {
@@ -633,8 +1016,13 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "  snapvault [-C directory] restore <revision> [--to directory] [--force]")
 	fmt.Fprintln(out, "  snapvault [-C directory] upgrade")
 	fmt.Fprintln(out, "  snapvault [-C directory] repack [--dry-run]")
-	fmt.Fprintln(out, "  snapvault [-C directory] index [--embedder builtin|ollama:<model>]")
+	fmt.Fprintln(out, "  snapvault [-C directory] index [--embedder builtin|static|static:<name>|ollama:<model>]")
 	fmt.Fprintln(out, "  snapvault [-C directory] find <query> [--limit n]")
+	fmt.Fprintln(out, "  snapvault model pull <name>")
+	fmt.Fprintln(out, "  snapvault model list")
+	fmt.Fprintln(out, "  snapvault [-C directory] eval run --questions <file> [--corpus <dir>]")
+	fmt.Fprintln(out, "      [--embedder ...] [-k n] [--beta f] [--pct n] [--json]")
+	fmt.Fprintln(out, "  snapvault [-C directory] eval generate --model <ollama-model> --out <file> [--per-file n]")
 	fmt.Fprintln(out)
 	fmt.Fprintln(out, "Revisions can be HEAD, HEAD~N, a full SHA-256 id, or a 7+ character prefix.")
 	fmt.Fprintln(out, "With no revisions, diff compares HEAD to the working directory.")

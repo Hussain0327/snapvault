@@ -1,6 +1,9 @@
 SHELL := /bin/sh
 
-.PHONY: all java go cpp test test-java test-go test-cpp interop clean
+GOLDEN_SEARCH_CORPUS    := tests/golden/search/corpus
+GOLDEN_SEARCH_QUESTIONS := tests/golden/search/questions.jsonl
+
+.PHONY: all java go cpp test test-java test-go test-cpp interop eval clean
 
 all: test
 
@@ -27,6 +30,16 @@ test-cpp: cpp
 
 interop: java go cpp
 	tests/interop.sh
+
+# eval runs the golden search-eval question set against the golden corpus
+# with both embedders. The builtin run needs nothing installed; the static
+# run needs the potion-base-8M model (`go/build/snapvault model pull
+# potion-base-8M`) and, if it's missing, fails with the CLI's own clear
+# "model potion-base-8M is not installed" message and a non-zero exit,
+# stopping this target rather than continuing silently.
+eval: go
+	./go/build/snapvault eval run --corpus $(GOLDEN_SEARCH_CORPUS) --questions $(GOLDEN_SEARCH_QUESTIONS) --embedder builtin
+	./go/build/snapvault eval run --corpus $(GOLDEN_SEARCH_CORPUS) --questions $(GOLDEN_SEARCH_QUESTIONS) --embedder static
 
 clean:
 	$(MAKE) -C java clean

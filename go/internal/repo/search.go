@@ -13,8 +13,17 @@ import (
 	"github.com/Hussain0327/snapvault/go/internal/search"
 )
 
-// errNoSearchIndex is Find's exact error when no index has been built yet.
+// errNoSearchIndex is OpenSearcher's exact error when no index has been
+// built yet.
 var errNoSearchIndex = errors.New("no search index; run 'snapvault index' first")
+
+// errIndexOutdated is OpenSearcher's exact error when the index on disk was
+// built by the older SVX1 format. Its text intentionally differs from
+// search.ErrIndexOutdated's own message ("... run 'snapvault index' to
+// rebuild"): every OpenSearcher failure ends in "run 'snapvault index'
+// first", the same instruction errNoSearchIndex gives, so a caller can
+// react to either without inspecting which one it got.
+var errIndexOutdated = errors.New("search index was built by an older SnapVault; run 'snapvault index' first")
 
 // IndexStats reports what one Index call did: how many blobs it embedded
 // (and how many chunks those blobs produced), and how many blobs it skipped
@@ -28,13 +37,16 @@ type IndexStats struct {
 // FindResult is one ranked search match, resolved to where it currently
 // lives: the blob's content id, the path it is reachable at in the newest
 // commit that still contains it, that commit's id, the first line of that
-// commit's message, and the matching chunk's snippet.
+// commit's message, the matching chunk's position and snippet, and its
+// fused score.
 type FindResult struct {
 	BlobID   string
 	Path     string
 	CommitID string
 	Message  string
 	Snippet  string
+	Sequence int32
+	Score    float32
 }
 
 // BlobLocation is where the newest commit reachable from any ref currently
@@ -50,11 +62,12 @@ func (r *Repository) indexPath() string {
 }
 
 // Index rebuilds the repository's search index sidecar: every unique blob
-// reachable from any ref is extracted, chunked, and embedded with embedder,
-// then written atomically to .snapvault/index/embeddings.svi. The rebuild is
-// always full, so a run with a different embedder than an existing index
-// naturally replaces it — there is nothing to reuse or reconcile.
-func (r *Repository) Index(embedder search.Embedder) (IndexStats, error) {
+// reachable from any ref is extracted, chunked per p, and embedded with
+// embedder, then written atomically to .snapvault/index/embeddings.svi. The
+// rebuild is always full, so a run with a different embedder or a different
+// p than an existing index naturally replaces it — there is nothing to
+// reuse or reconcile.
+func (r *Repository) Index(embedder search.Embedder, p search.Pipeline) (IndexStats, error) {
 	lock, err := acquireLock(filepath.Join(r.metadata, "lock"))
 	if err != nil {
 		return IndexStats{}, err
@@ -71,8 +84,8 @@ func (r *Repository) Index(embedder search.Embedder) (IndexStats, error) {
 	}
 	slices.Sort(ids)
 
+	idx := search.NewIndex(embedder.ID(), 0, p.IndexHash())
 	var stats IndexStats
-	var entries []search.Entry
 	for _, id := range ids {
 		typ, payload, err := r.store.Get(id)
 		if err != nil {
@@ -86,18 +99,13 @@ func (r *Repository) Index(embedder search.Embedder) (IndexStats, error) {
 			stats.Skipped++
 			continue
 		}
-		chunks := search.ChunkText(text)
+		chunks := search.ChunkText(text, p)
 		for _, c := range chunks {
 			vec, err := embedder.Embed(c.Text)
 			if err != nil {
 				return IndexStats{}, fmt.Errorf("embedding %s: %w", id, err)
 			}
-			entries = append(entries, search.Entry{
-				BlobID:   id,
-				Sequence: int32(c.Sequence),
-				Snippet:  c.Snippet,
-				Vector:   vec,
-			})
+			idx.Add(id, c, vec, search.Terms(c.Text, p.Stopwords))
 		}
 		stats.Blobs++
 		stats.Chunks += len(chunks)
@@ -112,74 +120,163 @@ func (r *Repository) Index(embedder search.Embedder) (IndexStats, error) {
 	if dim <= 0 {
 		dim = 1
 	}
-	idx := search.Index{EmbedderID: embedder.ID(), Dim: int32(dim), Entries: entries}
+	idx.Dim = int32(dim)
 	if err := search.Write(r.indexPath(), idx); err != nil {
 		return IndexStats{}, err
 	}
 	return stats, nil
 }
 
-// Find ranks the repository's search index against query and resolves each
-// match to where it lives right now: the newest commit reachable from any
-// ref that still contains the matching blob, and that blob's path there.
-// Resolution always walks the repository fresh, so a result is never stale
-// even if the index predates a later snapshot.
-func (r *Repository) Find(query string, limit int) ([]FindResult, error) {
+// Searcher holds an open search index, the embedder it names, and the map
+// of every blob currently reachable from any ref, so a caller can rank many
+// queries without re-decoding the index or re-walking history for each one.
+// It holds the repository's process-level lock for its entire lifetime, so
+// a caller must Close it promptly.
+type Searcher struct {
+	repo      *Repository
+	lock      *repoLock
+	pipeline  search.Pipeline
+	embedder  search.Embedder
+	idx       *search.Index
+	locations map[string]BlobLocation
+	closed    bool
+}
+
+// OpenSearcher acquires the repository lock, decodes the search index, and
+// resolves every blob currently reachable from any ref, for ranking with p's
+// query-time settings. A missing index or one built by the older SVX1
+// format both fail with an error ending in "run 'snapvault index' first".
+func (r *Repository) OpenSearcher(p search.Pipeline) (*Searcher, error) {
 	lock, err := acquireLock(filepath.Join(r.metadata, "lock"))
 	if err != nil {
 		return nil, err
 	}
-	defer lock.close()
+	releaseOnError := true
+	defer func() {
+		if releaseOnError {
+			lock.close()
+		}
+	}()
 
 	if _, err := os.Stat(r.indexPath()); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, errNoSearchIndex
 		}
 		return nil, err
 	}
 	idx, err := search.Read(r.indexPath())
 	if err != nil {
+		if errors.Is(err, search.ErrIndexOutdated) {
+			return nil, errIndexOutdated
+		}
 		return nil, err
 	}
 	embedder, err := search.NewEmbedder(idx.EmbedderID)
 	if err != nil {
 		return nil, err
 	}
-	matches, err := search.Search(embedder, idx, query, limit)
-	if err != nil {
-		return nil, err
-	}
-	if len(matches) == 0 {
-		return nil, nil
-	}
-
 	locations, err := r.reachableSearchBlobs()
 	if err != nil {
 		return nil, err
 	}
 
-	results := make([]FindResult, 0, len(matches))
-	for _, m := range matches {
-		loc, ok := locations[m.BlobID]
+	releaseOnError = false
+	return &Searcher{
+		repo:      r,
+		lock:      lock,
+		pipeline:  p,
+		embedder:  embedder,
+		idx:       idx,
+		locations: locations,
+	}, nil
+}
+
+// EmbedderID returns the embedder id the open index was built with.
+func (s *Searcher) EmbedderID() string { return s.idx.EmbedderID }
+
+// IndexHash returns the open index's stored Pipeline.IndexHash(), for
+// comparison against a fresh Pipeline's own IndexHash to detect a
+// chunking-settings mismatch.
+func (s *Searcher) IndexHash() string { return s.idx.IndexHash }
+
+// Rank ranks every reachable blob's chunks against query, hiding entries
+// for blobs history has made unreachable from any ref.
+func (s *Searcher) Rank(query string) ([]search.Result, error) {
+	allow := func(blobID string) bool {
+		_, ok := s.locations[blobID]
+		return ok
+	}
+	return search.Rank(s.pipeline, s.embedder, s.idx, query, allow)
+}
+
+// Find ranks query, keeps each matching blob's best-scoring chunk, and
+// resolves the top limit blobs to where they currently live: the newest
+// commit reachable from any ref that still contains the blob, and its path
+// there.
+func (s *Searcher) Find(query string, limit int) ([]FindResult, error) {
+	ranked, err := s.Rank(query)
+	if err != nil {
+		return nil, err
+	}
+	grouped := search.GroupByBlob(ranked)
+	if len(grouped) > limit {
+		grouped = grouped[:limit]
+	}
+
+	results := make([]FindResult, 0, len(grouped))
+	for _, res := range grouped {
+		loc, ok := s.locations[res.BlobID]
 		if !ok {
-			// The index remembers a blob no longer reachable from any ref;
-			// nothing to annotate it with, so it is left out of the results
-			// rather than shown with a stale or missing location.
+			// Rank's allow function already hid unreachable blobs; this
+			// only guards against a future change to that invariant rather
+			// than a case reachable today.
 			continue
 		}
-		commit, err := r.ReadCommit(loc.CommitID)
+		commit, err := s.repo.ReadCommit(loc.CommitID)
 		if err != nil {
 			return nil, err
 		}
 		results = append(results, FindResult{
-			BlobID:   m.BlobID,
+			BlobID:   res.BlobID,
 			Path:     loc.Path,
 			CommitID: loc.CommitID,
 			Message:  firstMessageLine(commit.Message),
-			Snippet:  m.Snippet,
+			Snippet:  res.Snippet,
+			Sequence: res.Sequence,
+			Score:    res.Score,
 		})
 	}
 	return results, nil
+}
+
+// Locate reports the newest commit and path a blob is reachable at, or
+// false if the blob is not (or no longer) reachable from any ref.
+func (s *Searcher) Locate(blobID string) (BlobLocation, bool) {
+	loc, ok := s.locations[blobID]
+	return loc, ok
+}
+
+// Close releases the repository lock this Searcher has held since
+// OpenSearcher. Calling Close more than once is safe.
+func (s *Searcher) Close() error {
+	if s.closed {
+		return nil
+	}
+	s.closed = true
+	return s.lock.close()
+}
+
+// Find opens a Searcher with the default pipeline, ranks query, and closes
+// the Searcher: a thin, one-shot wrapper for callers that do not need to
+// issue more than one query. eval.Run uses OpenSearcher directly instead,
+// so a batch of queries shares one lock acquisition and one index decode.
+func (r *Repository) Find(query string, limit int) ([]FindResult, error) {
+	s, err := r.OpenSearcher(search.DefaultPipeline())
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	return s.Find(query, limit)
 }
 
 // reachableSearchBlobs walks every commit reachable from every ref and every
@@ -254,6 +351,68 @@ func (r *Repository) walkTreeForSearch(
 		locations[entry.ObjectID] = BlobLocation{CommitID: commitID, Path: path}
 	}
 	return nil
+}
+
+// HeadPaths returns the id of the blob currently reachable at every path in
+// the commit HEAD points to: a single walk of HEAD's own tree, not the
+// blended cross-history view reachableSearchBlobs builds for find. eval.Run
+// uses it once per run to resolve every question's path "at HEAD" per the
+// eval spec, rather than the newest commit that merely still contains a
+// given blob's content. It returns an empty, non-nil map if the repository
+// has no snapshots yet.
+func (r *Repository) HeadPaths() (map[string]string, error) {
+	head, err := r.Head()
+	if err != nil {
+		return nil, err
+	}
+	paths := make(map[string]string)
+	if head == "" {
+		return paths, nil
+	}
+	commit, err := r.ReadCommit(head)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.walkTreeForHeadPaths(commit.TreeID, "", paths); err != nil {
+		return nil, err
+	}
+	return paths, nil
+}
+
+func (r *Repository) walkTreeForHeadPaths(treeID string, prefix string, paths map[string]string) error {
+	tree, err := r.readTree(treeID)
+	if err != nil {
+		return err
+	}
+	for _, entry := range tree.Entries() {
+		path := entry.Name
+		if prefix != "" {
+			path = prefix + "/" + entry.Name
+		}
+		if entry.Kind == object.KindDirectory {
+			if err := r.walkTreeForHeadPaths(entry.ObjectID, path, paths); err != nil {
+				return err
+			}
+			continue
+		}
+		paths[path] = entry.ObjectID
+	}
+	return nil
+}
+
+// BlobBytes returns the raw stored bytes of the blob id, for a caller that
+// needs a blob's full original content rather than a chunk's snippet —
+// eval.Run extracts and locates highlights in it directly, independent of
+// whatever chunking a search index happens to hold.
+func (r *Repository) BlobBytes(id string) ([]byte, error) {
+	typ, payload, err := r.store.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	if typ != object.TypeBlob {
+		return nil, fmt.Errorf("object is not a blob: %s", id)
+	}
+	return payload, nil
 }
 
 // allRefHeads returns the commit id at the tip of every ref, sorted for a
