@@ -39,6 +39,17 @@ func NewEmbedder(id string) (Embedder, error) {
 	if model, ok := strings.CutPrefix(id, "ollama:"); ok && model != "" {
 		return NewOllamaEmbedder(model), nil
 	}
+	if name, _, ok := parseStaticID(id); ok {
+		e, err := NewStaticEmbedder(name)
+		if err != nil {
+			return nil, err
+		}
+		if got := e.ID(); got != id {
+			return nil, fmt.Errorf(
+				"static model %s digest mismatch: index expects %s, installed model is %s", name, id, got)
+		}
+		return e, nil
+	}
 	return nil, fmt.Errorf("unknown embedder: %s", id)
 }
 

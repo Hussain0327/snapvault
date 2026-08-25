@@ -2,12 +2,18 @@ package cli
 
 import (
 	"bytes"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Hussain0327/snapvault/go/internal/repo"
+	"github.com/Hussain0327/snapvault/go/internal/search"
 )
 
 type result struct {
@@ -505,5 +511,265 @@ func TestFindEscapesControlBytesInSnippet(t *testing.T) {
 	}
 	if !strings.Contains(find.out, `\x1b[31mALERT\x07`) {
 		t.Errorf("find output = %q, want the ANSI escape sequence escaped", find.out)
+	}
+}
+
+// TestFindPrintsNoteOnIndexHashMismatch simulates the autoretrieval loop
+// changing pipeline.go's index-time defaults between an old "snapvault
+// index" run and a later "snapvault find": it builds the index directly
+// through package repo with a Pipeline that differs from
+// search.DefaultPipeline(), the one runFind uses, then checks find still
+// succeeds but warns on stderr.
+func TestFindPrintsNoteOnIndexHashMismatch(t *testing.T) {
+	dir := initialized(t)
+	write(t, dir, "notes.txt", "the harbor lighthouse guides ships through fog")
+	run(t, t.TempDir(), "-C", dir, "snapshot", "-m", "first")
+
+	r, err := repo.Open(dir)
+	if err != nil {
+		t.Fatalf("repo.Open = %v", err)
+	}
+	stale := search.DefaultPipeline()
+	stale.ChunkRunes = 400
+	if _, err := r.Index(search.LexicalEmbedder{}, stale); err != nil {
+		t.Fatalf("Index = %v", err)
+	}
+
+	got := run(t, t.TempDir(), "-C", dir, "find", "harbor lighthouse fog")
+	if got.code != 0 {
+		t.Fatalf("find = %+v", got)
+	}
+	wantNote := "note: index was built with different chunking settings; run 'snapvault index' to rebuild"
+	if !strings.Contains(got.err, wantNote) {
+		t.Errorf("find stderr = %q, want it to contain %q", got.err, wantNote)
+	}
+}
+
+// TestFindDoesNotWarnWhenIndexHashMatches proves the mismatch note from
+// TestFindPrintsNoteOnIndexHashMismatch stays silent on the common path: an
+// index built by "snapvault index" itself always matches
+// search.DefaultPipeline().
+func TestFindDoesNotWarnWhenIndexHashMatches(t *testing.T) {
+	dir := initialized(t)
+	write(t, dir, "notes.txt", "the harbor lighthouse guides ships through fog")
+	run(t, t.TempDir(), "-C", dir, "snapshot", "-m", "first")
+	run(t, t.TempDir(), "-C", dir, "index")
+
+	got := run(t, t.TempDir(), "-C", dir, "find", "harbor lighthouse fog")
+	if got.code != 0 {
+		t.Fatalf("find = %+v", got)
+	}
+	if strings.Contains(got.err, "note:") {
+		t.Errorf("find stderr = %q, want no mismatch note when the index matches", got.err)
+	}
+}
+
+func TestIndexEmbedderStaticNotInstalled(t *testing.T) {
+	dir := initialized(t)
+	write(t, dir, "f.txt", "content")
+	run(t, t.TempDir(), "-C", dir, "snapshot", "-m", "first")
+	t.Setenv("SNAPVAULT_MODEL_DIR", t.TempDir())
+
+	got := run(t, t.TempDir(), "-C", dir, "index", "--embedder", "static")
+	if got.code != 1 {
+		t.Fatalf("index --embedder static (not installed) = %+v, want exit 1", got)
+	}
+	want := "model potion-base-8M is not installed; run 'snapvault model pull potion-base-8M'"
+	if !strings.Contains(got.err, want) {
+		t.Errorf("index --embedder static err = %q, want it to contain %q", got.err, want)
+	}
+
+	named := run(t, t.TempDir(), "-C", dir, "index", "--embedder", "static:custom-model")
+	if named.code != 1 {
+		t.Fatalf("index --embedder static:custom-model (not installed) = %+v, want exit 1", named)
+	}
+	wantNamed := "model custom-model is not installed; run 'snapvault model pull custom-model'"
+	if !strings.Contains(named.err, wantNamed) {
+		t.Errorf("index --embedder static:custom-model err = %q, want it to contain %q", named.err, wantNamed)
+	}
+}
+
+func TestModelPullRejectsUnknownOrMalformedArguments(t *testing.T) {
+	if got := run(t, t.TempDir(), "model", "pull", "not-a-real-model"); got.code != 2 {
+		t.Errorf("model pull not-a-real-model = %+v, want a usage error", got)
+	}
+	if got := run(t, t.TempDir(), "model", "pull"); got.code != 2 {
+		t.Errorf("model pull (no name) = %+v, want a usage error", got)
+	}
+	if got := run(t, t.TempDir(), "model", "pull", "a", "b"); got.code != 2 {
+		t.Errorf("model pull a b = %+v, want a usage error", got)
+	}
+}
+
+func TestModelListReportsNotInstalled(t *testing.T) {
+	t.Setenv("SNAPVAULT_MODEL_DIR", t.TempDir())
+
+	got := run(t, t.TempDir(), "model", "list")
+	if got.code != 0 {
+		t.Fatalf("model list = %+v", got)
+	}
+	if !strings.Contains(got.out, "potion-base-8M") || !strings.Contains(got.out, "not installed") {
+		t.Errorf("model list output = %q, want it to mention potion-base-8M and not installed", got.out)
+	}
+	if got := run(t, t.TempDir(), "model", "list", "extra"); got.code != 2 {
+		t.Errorf("model list extra = %+v, want a usage error", got)
+	}
+}
+
+func TestModelUnknownSubcommand(t *testing.T) {
+	if got := run(t, t.TempDir(), "model", "bogus"); got.code != 2 {
+		t.Errorf("model bogus = %+v, want a usage error", got)
+	}
+	if got := run(t, t.TempDir(), "model"); got.code != 2 {
+		t.Errorf("model (no subcommand) = %+v, want a usage error", got)
+	}
+}
+
+// writeQuestionsFile writes lines (already-encoded JSON objects, one per
+// question) as a JSON Lines question file and returns its path.
+func writeQuestionsFile(t *testing.T, dir string, lines ...string) string {
+	t.Helper()
+	path := filepath.Join(dir, "questions.jsonl")
+	content := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("WriteFile(questions.jsonl) = %v", err)
+	}
+	return path
+}
+
+func TestEvalRunOverInlineCorpusPrintsTableAndJSON(t *testing.T) {
+	corpus := t.TempDir()
+	write(t, corpus, "note.txt", "The harbor lighthouse guides ships safely through dense evening fog.")
+
+	questions := writeQuestionsFile(t, t.TempDir(),
+		`{"id":"q1","question":"harbor lighthouse fog","path":"note.txt","highlight":"guides ships safely through dense evening fog","tags":["lexical"]}`,
+	)
+
+	table := run(t, t.TempDir(), "eval", "run", "--questions", questions, "--corpus", corpus)
+	if table.code != 0 {
+		t.Fatalf("eval run (table) = %+v", table)
+	}
+	if !strings.Contains(table.out, "embedder=builtin-lexical-v1") {
+		t.Errorf("eval run table output = %q, want an embedder header", table.out)
+	}
+	if !strings.Contains(table.out, "overall") {
+		t.Errorf("eval run table output = %q, want an overall summary line", table.out)
+	}
+
+	jsonResult := run(t, t.TempDir(), "eval", "run", "--questions", questions, "--corpus", corpus, "--json")
+	if jsonResult.code != 0 {
+		t.Fatalf("eval run --json = %+v", jsonResult)
+	}
+	var report struct {
+		EmbedderID string `json:"embedderID"`
+		Overall    struct {
+			N int `json:"n"`
+		} `json:"overall"`
+	}
+	if err := json.Unmarshal([]byte(jsonResult.out), &report); err != nil {
+		t.Fatalf("json.Unmarshal(eval run --json output) = %v; output was %q", err, jsonResult.out)
+	}
+	if report.EmbedderID != "builtin-lexical-v1" {
+		t.Errorf("report.EmbedderID = %q, want %q", report.EmbedderID, "builtin-lexical-v1")
+	}
+	if report.Overall.N != 1 {
+		t.Errorf("report.Overall.N = %d, want 1", report.Overall.N)
+	}
+}
+
+func TestEvalRunFailsWithQuestionIDAndPathWhenHighlightMissing(t *testing.T) {
+	corpus := t.TempDir()
+	write(t, corpus, "note.txt", "Completely unrelated content about something else entirely.")
+
+	questions := writeQuestionsFile(t, t.TempDir(),
+		`{"id":"q-bad","question":"anything","path":"note.txt","highlight":"text nowhere in the file"}`,
+	)
+
+	got := run(t, t.TempDir(), "eval", "run", "--questions", questions, "--corpus", corpus)
+	if got.code != 1 {
+		t.Fatalf("eval run with a missing highlight = %+v, want exit 1", got)
+	}
+	if !strings.Contains(got.err, "q-bad") || !strings.Contains(got.err, "note.txt") {
+		t.Errorf("eval run error = %q, want it to name the question id and path", got.err)
+	}
+}
+
+func TestEvalRunRejectsMissingRequiredFlags(t *testing.T) {
+	if got := run(t, t.TempDir(), "eval", "run"); got.code != 2 {
+		t.Errorf("eval run (no --questions) = %+v, want a usage error", got)
+	}
+	questions := writeQuestionsFile(t, t.TempDir(), `{"id":"q1","question":"q","path":"p","highlight":"h"}`)
+	if got := run(t, t.TempDir(), "eval", "run", "--questions", questions, "--embedder", "nonsense"); got.code != 2 {
+		t.Errorf("eval run --embedder nonsense = %+v, want a usage error", got)
+	}
+	if got := run(t, t.TempDir(), "eval", "bogus"); got.code != 2 {
+		t.Errorf("eval bogus = %+v, want a usage error", got)
+	}
+	if got := run(t, t.TempDir(), "eval"); got.code != 2 {
+		t.Errorf("eval (no subcommand) = %+v, want a usage error", got)
+	}
+}
+
+// TestEvalRunRejectsNonPositivePct checks that --pct is validated like its
+// sibling flags -k and --beta (both reject non-positive input): a bare
+// strconv.Atoi used to accept 0 or a negative --pct and silently run every
+// question, exactly as --pct 100 does, with no indication the flag was
+// ignored.
+func TestEvalRunRejectsNonPositivePct(t *testing.T) {
+	corpus := t.TempDir()
+	write(t, corpus, "note.txt", "The harbor lighthouse guides ships safely through dense evening fog.")
+	questions := writeQuestionsFile(t, t.TempDir(),
+		`{"id":"q1","question":"harbor lighthouse fog","path":"note.txt","highlight":"guides ships safely through dense evening fog"}`,
+	)
+
+	for _, pct := range []string{"0", "-5", "101"} {
+		if got := run(t, t.TempDir(), "eval", "run", "--questions", questions, "--corpus", corpus, "--pct", pct); got.code != 2 {
+			t.Errorf("eval run --pct %s = %+v, want a usage error", pct, got)
+		}
+	}
+}
+
+func TestEvalGenerateAgainstHTTPTestServer(t *testing.T) {
+	dir := initialized(t)
+	write(t, dir, "note.txt", "The quartz spires rise above the misty valley at dawn every single day.")
+	if got := run(t, t.TempDir(), "-C", dir, "snapshot", "-m", "first"); got.code != 0 {
+		t.Fatalf("snapshot = %+v", got)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner := `{"pairs":[{"question":"What rises above the valley?","quote":"The quartz spires rise above the misty valley"}]}`
+		json.NewEncoder(w).Encode(map[string]string{"response": inner})
+	}))
+	defer server.Close()
+
+	restore := evalOllamaBaseURL
+	evalOllamaBaseURL = server.URL
+	defer func() { evalOllamaBaseURL = restore }()
+
+	outPath := filepath.Join(t.TempDir(), "generated.jsonl")
+	got := run(t, t.TempDir(), "-C", dir, "eval", "generate", "--model", "test-model", "--out", outPath)
+	if got.code != 0 {
+		t.Fatalf("eval generate = %+v", got)
+	}
+	if !strings.Contains(got.err, "wrote 1 question") {
+		t.Errorf("eval generate stderr = %q, want it to report 1 written question", got.err)
+	}
+
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("ReadFile(out) = %v", err)
+	}
+	if !strings.Contains(string(data), `"note.txt"`) {
+		t.Errorf("generated file = %q, want a question naming note.txt", string(data))
+	}
+}
+
+func TestEvalGenerateRejectsMissingRequiredFlags(t *testing.T) {
+	dir := initialized(t)
+	if got := run(t, t.TempDir(), "-C", dir, "eval", "generate", "--out", "x.jsonl"); got.code != 2 {
+		t.Errorf("eval generate (no --model) = %+v, want a usage error", got)
+	}
+	if got := run(t, t.TempDir(), "-C", dir, "eval", "generate", "--model", "m"); got.code != 2 {
+		t.Errorf("eval generate (no --out) = %+v, want a usage error", got)
 	}
 }

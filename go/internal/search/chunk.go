@@ -5,35 +5,24 @@ import (
 	"unicode"
 )
 
-const (
-	// chunkRunes is the target chunk size. Chunks land at a whitespace split
-	// point near this size rather than exactly on it.
-	chunkRunes = 1200
-	// chunkOverlapRunes is how far the next chunk's start backs up from the
-	// previous chunk's end, so a match spanning a chunk boundary still
-	// appears whole in at least one chunk.
-	chunkOverlapRunes = 200
-	// splitLookbackRunes bounds how far a split point may back up from the
-	// target chunk size while searching for whitespace.
-	splitLookbackRunes = 200
-	// snippetRunes is the length of the human-readable preview stored beside
-	// each chunk's embedding.
-	snippetRunes = 160
-)
-
-// Chunk is one piece of a blob's extracted text: the text itself, its
-// position among the blob's chunks, and a short preview for search results.
+// Chunk is one piece of a blob's extracted text: its position among the
+// blob's chunks, its offsets into that text, the text itself, and a short
+// preview for search results.
 type Chunk struct {
-	Sequence int
-	Text     string
-	Snippet  string
+	Sequence  int
+	StartRune int // offset into the extracted text, inclusive
+	EndRune   int // exclusive; []rune(text)[StartRune:EndRune] == Text
+	Text      string
+	Snippet   string
 }
 
-// ChunkText splits text into overlapping pieces of about chunkRunes runes,
-// preferring to split at whitespace, and returns nil for empty input. Each
-// chunk carries a snippet: its first snippetRunes runes with newlines
-// flattened to spaces.
-func ChunkText(text string) []Chunk {
+// ChunkText splits text into overlapping pieces of about p.ChunkRunes
+// runes, preferring to split at whitespace, and returns nil for empty
+// input. Each chunk carries a snippet: its first p.SnippetRunes runes with
+// newlines flattened to spaces. StartRune and EndRune are recomputed after
+// trimming surrounding whitespace from the raw split, so
+// []rune(text)[c.StartRune:c.EndRune] == c.Text holds for every chunk c.
+func ChunkText(text string, p Pipeline) []Chunk {
 	runes := []rune(text)
 	if len(runes) == 0 {
 		return nil
@@ -41,42 +30,61 @@ func ChunkText(text string) []Chunk {
 
 	var chunks []Chunk
 	for start := 0; start < len(runes); {
-		end := min(start+chunkRunes, len(runes))
+		end := min(start+p.ChunkRunes, len(runes))
 		if end < len(runes) {
-			end = splitPoint(runes, start, end)
+			end = splitPoint(runes, start, end, p.LookbackRunes)
 		}
-		piece := strings.TrimSpace(string(runes[start:end]))
-		if piece != "" {
+		left, right := trimRuneRange(runes, start, end)
+		if left < right {
+			text := string(runes[left:right])
 			chunks = append(chunks, Chunk{
-				Sequence: len(chunks),
-				Text:     piece,
-				Snippet:  snippet(piece),
+				Sequence:  len(chunks),
+				StartRune: left,
+				EndRune:   right,
+				Text:      text,
+				Snippet:   snippet(text, p.SnippetRunes),
 			})
 		}
 		if end >= len(runes) {
 			break
 		}
-		next := end - chunkOverlapRunes
+		next := end - p.OverlapRunes
 		if next <= start {
 			// A split point right after the previous start would make no
 			// progress; fall back to the unoverlapped boundary instead of
 			// looping forever.
 			next = end
 		} else {
-			// Nudge forward to the next word boundary so the overlap region
-			// does not start mid-word.
-			next = nextSplitPoint(runes, next, end)
+			// Nudge forward to the next word boundary so the overlap
+			// region does not start mid-word.
+			next = nextSplitPoint(runes, next, end, p.LookbackRunes)
 		}
 		start = next
 	}
 	return chunks
 }
 
-// splitPoint looks backward from end, within splitLookbackRunes of it, for a
-// whitespace rune to split on. It returns end unchanged when none is found,
-// so a single very long word is simply cut.
-func splitPoint(runes []rune, start, end int) int {
-	limit := max(start, end-splitLookbackRunes)
+// trimRuneRange returns the [left, right) sub-range of runes[start:end]
+// with leading and trailing whitespace trimmed, equivalent to applying
+// strings.TrimSpace to string(runes[start:end]) but reporting offsets into
+// runes rather than a new string.
+func trimRuneRange(runes []rune, start, end int) (left, right int) {
+	left = start
+	for left < end && unicode.IsSpace(runes[left]) {
+		left++
+	}
+	right = end
+	for right > left && unicode.IsSpace(runes[right-1]) {
+		right--
+	}
+	return left, right
+}
+
+// splitPoint looks backward from end, within lookback runes of it, for a
+// whitespace rune to split on. It returns end unchanged when none is
+// found, so a single very long word is simply cut.
+func splitPoint(runes []rune, start, end, lookback int) int {
+	limit := max(start, end-lookback)
 	for i := end; i > limit; i-- {
 		if unicode.IsSpace(runes[i-1]) {
 			return i
@@ -85,12 +93,12 @@ func splitPoint(runes []rune, start, end int) int {
 	return end
 }
 
-// nextSplitPoint looks forward from from, within splitLookbackRunes of it,
-// for a whitespace rune and returns the index just past it. It returns from
+// nextSplitPoint looks forward from from, within lookback runes of it, for
+// a whitespace rune and returns the index just past it. It returns from
 // unchanged when none is found within limit, so a single very long word is
 // simply cut.
-func nextSplitPoint(runes []rune, from, limit int) int {
-	bound := min(from+splitLookbackRunes, limit)
+func nextSplitPoint(runes []rune, from, limit, lookback int) int {
+	bound := min(from+lookback, limit)
 	for i := from; i < bound; i++ {
 		if unicode.IsSpace(runes[i]) {
 			return i + 1
@@ -101,7 +109,7 @@ func nextSplitPoint(runes []rune, from, limit int) int {
 
 // snippet returns the first snippetRunes runes of text with newlines
 // flattened to single spaces, for display beside a search result.
-func snippet(text string) string {
+func snippet(text string, snippetRunes int) string {
 	flattened := strings.NewReplacer("\n", " ", "\r", " ").Replace(text)
 	runes := []rune(flattened)
 	if len(runes) > snippetRunes {

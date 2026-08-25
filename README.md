@@ -162,31 +162,80 @@ zstd is a build dependency in every language, but not the same dependency:
 ## Search: `snapvault find`
 
 `snapvault index` builds a local search index over every blob reachable
-from every ref, at `.snapvault/index/embeddings.svi`.
+from every ref, at `.snapvault/index/embeddings.svi` (the "SVX2" format).
 `snapvault find <query>` searches it.
 Both are Go-only and both treat the index as a sidecar: it never touches
 `objects/`, `fsck` ignores it, and deleting it just means the next `find`
 tells you to reindex.
 
-Be clear about what kind of "search" this is by default.
-`snapvault index` with no `--embedder` flag uses `builtin-lexical-v1`: a
-deterministic hashed bag-of-words keyword matcher.
-It is not semantic search — it will not know that "car" and "automobile"
-are related.
-For real semantic embeddings, run a local [Ollama](https://ollama.com) and
-pass `--embedder ollama:<model>`; SnapVault then POSTs to
-`http://localhost:11434/api/embeddings` for each chunk and each query.
-Either way nothing leaves the machine: the builtin embedder is pure
-computation, and the Ollama path only ever talks to localhost.
+Ranking is hybrid: every query is scored two independent ways and the two
+rankings are fused by reciprocal rank fusion (or, with `Pipeline.Fusion =
+"alpha"`, a min-max-normalized linear blend).
+
+- **Lexical** — BM25 over the same term set for every embedder, so keyword
+  queries always work even against a purely semantic embedder's index.
+- **Dense** — cosine similarity between the query's embedding and each
+  chunk's, from whichever embedder built the index.
+
+Three embedders are available, chosen with `index --embedder`:
+
+- `builtin` (the default): `builtin-lexical-v1`, a deterministic hashed
+  bag-of-words.
+  It is not semantic — it will not know that "car" and "automobile" are
+  related — but it needs nothing installed and never touches the network.
+- `static` (or `static:<name>`): a real offline semantic embedder, a pure-Go
+  port of [Model2Vec](https://github.com/MinishLab/model2vec)'s
+  `minishlab/potion-base-8M` — a static embedding table plus a WordPiece
+  tokenizer, no model runtime required.
+  Run `snapvault model pull potion-base-8M` once to download it (the one
+  command in the whole CLI that opens a network connection); after that,
+  `index` and `find` never touch the network.
+  `snapvault model list` reports what's installed and where.
+  The model is cached at `$SNAPVAULT_MODEL_DIR/<name>` when that
+  environment variable is set, otherwise under the OS user cache directory
+  (`os.UserCacheDir()/snapvault/models/<name>`).
+- `ollama:<model>`: for a locally running [Ollama](https://ollama.com).
+  SnapVault POSTs to `http://localhost:11434/api/embeddings` for each chunk
+  and each query; nothing leaves the machine, since Ollama itself is local.
+
 Text extraction covers UTF-8 text and simple PDFs (via `pdftotext` when
 it's on `PATH`, otherwise a small builtin extractor); anything else is
 skipped and counted as skipped.
 
+The default embedder stays `builtin` until an eval run justifies changing
+it — see the next section.
+
+## Measuring retrieval quality: `snapvault eval`
+
+`snapvault eval run` scores `find`'s retrieval against a question set: each
+question names a passage (`highlight`) of a file that answers it, and the
+harness compares that passage's rune offsets against what was actually
+retrieved, reporting precision, recall, F-beta, IoU, and blob-level hit
+rate / MRR, overall and per question tag.
+
+```console
+$ snapvault model pull potion-base-8M    # once, to try the static embedder
+$ snapvault eval run \
+    --corpus tests/golden/search/corpus \
+    --questions tests/golden/search/questions.jsonl \
+    --embedder static
+```
+
+`tests/golden/search/` is a committed ~50-document, ~100-question fixture
+(see its `MANIFEST.md`) that runs in CI as a quality floor for both
+embedders, recorded in `baseline.json`.
+`snapvault eval generate --model <ollama-model> --out <file>` builds a
+question file like it from your own repository's own files, via a local
+Ollama model, for scoring `find` against your own content instead.
+`docs/autoretrieval/` documents the tuning loop this harness feeds: an
+agent may edit `go/internal/search/pipeline.go` and nothing else, gated on
+`make eval`'s headline number actually improving.
+
 ## Commands
 
 The Java and Go CLIs take the same commands and print the same output for
-everything both of them implement; `upgrade`, `repack`, `index`, and
-`find` are Go-only, per the format v2 design.
+everything both of them implement; `upgrade`, `repack`, `index`, `find`,
+`model`, and `eval` are Go-only, per the format v2 design.
 
 ```text
 snapvault init [directory]
@@ -198,6 +247,12 @@ snapvault [-C directory] upgrade                   # v1 -> v2, idempotent
 snapvault [-C directory] repack [--dry-run]        # shrink object storage
 snapvault [-C directory] index [--embedder ...]    # build the search index
 snapvault [-C directory] find <query> [--limit n]  # search indexed blobs
+snapvault model pull <name>                        # the only network call
+snapvault model list
+snapvault [-C directory] eval run --questions <file> [--corpus <dir>]
+    [--embedder ...] [-k n] [--beta f] [--pct n] [--json]
+snapvault [-C directory] eval generate --model <ollama-model> --out <file>
+    [--per-file n]
 ```
 
 Revisions are `HEAD`, `HEAD~2`, a full id, or a 7+ character prefix.
