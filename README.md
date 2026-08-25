@@ -161,21 +161,27 @@ zstd is a build dependency in every language, but not the same dependency:
 
 ## Search: `snapvault find`
 
-`snapvault index` builds a local search index over every blob reachable
-from every ref, at `.snapvault/index/embeddings.svi` (the "SVX2" format).
-`snapvault find <query>` searches it.
-Both are Go-only and both treat the index as a sidecar: it never touches
-`objects/`, `fsck` ignores it, and deleting it just means the next `find`
-tells you to reindex.
+`snapvault index` builds a search index over every blob reachable from
+every ref; `snapvault find <query>` searches it.
+The index is a sidecar at `.snapvault/index/embeddings.svi` (format
+"SVX2"): it never touches `objects/`, `fsck` ignores it, and deleting it
+only means the next `find` tells you to reindex.
+Both commands are Go-only.
 
-Ranking is hybrid: every query is scored two independent ways and the two
-rankings are fused by reciprocal rank fusion (or, with `Pipeline.Fusion =
-"alpha"`, a min-max-normalized linear blend).
+Ranking is hybrid.
+Every chunk is scored two independent ways and the two rankings are fused,
+so keyword queries keep working even against a semantic embedder's index:
 
-- **Lexical** — BM25 over the same term set for every embedder, so keyword
-  queries always work even against a purely semantic embedder's index.
-- **Dense** — cosine similarity between the query's embedding and each
-  chunk's, from whichever embedder built the index.
+```text
+index   blob ──► Extract ──► ChunkText ──┬──► embedder ──► vector    ─┐
+             (text, PDF)   (1200 runes,   └──► Terms ──► term counts ─┴──► SVX2
+                            200 overlap)
+
+find    query ──┬──► embed ──► cosine ──► dense ranking   ──┐
+                └──► Terms ──► BM25   ──► lexical ranking ──┤
+                                                            ▼
+              results ◄── best chunk per file ◄── rank fusion
+```
 
 Three embedders are available, chosen with `index --embedder`:
 
@@ -183,53 +189,144 @@ Three embedders are available, chosen with `index --embedder`:
   bag-of-words.
   It is not semantic — it will not know that "car" and "automobile" are
   related — but it needs nothing installed and never touches the network.
-- `static` (or `static:<name>`): a real offline semantic embedder, a pure-Go
-  port of [Model2Vec](https://github.com/MinishLab/model2vec)'s
+- `static`: a real offline semantic embedder, a pure-Go port of
+  [Model2Vec](https://github.com/MinishLab/model2vec)'s
   `minishlab/potion-base-8M` — a static embedding table plus a WordPiece
   tokenizer, no model runtime required.
-  Run `snapvault model pull potion-base-8M` once to download it (the one
-  command in the whole CLI that opens a network connection); after that,
-  `index` and `find` never touch the network.
-  `snapvault model list` reports what's installed and where.
-  The model is cached at `$SNAPVAULT_MODEL_DIR/<name>` when that
-  environment variable is set, otherwise under the OS user cache directory
-  (`os.UserCacheDir()/snapvault/models/<name>`).
+  One 30 MB download, then everything is local.
 - `ollama:<model>`: for a locally running [Ollama](https://ollama.com).
   SnapVault POSTs to `http://localhost:11434/api/embeddings` for each chunk
   and each query; nothing leaves the machine, since Ollama itself is local.
+
+### Using search
+
+```console
+$ make go                                          # builds go/build/snapvault
+$ go/build/snapvault model pull potion-base-8M     # once; the only network call
+$ go/build/snapvault model list
+potion-base-8M  installed  /Users/you/Library/Caches/snapvault/models/potion-base-8M
+
+$ go/build/snapvault -C ~/Documents/notes index --embedder static
+indexed 412 blobs (1873 chunks) with static:potion-base-8M@f65d0f325faa
+
+$ go/build/snapvault -C ~/Documents/notes find "when does the car insurance renew"
+3726b03a0d95  finance/auto-policy.md  (snapshot: "before cleanup", 9b0084d65380)
+    The automobile policy renews on 14 March; the premium is due ten days before ...
+```
+
+Reindex (`snapvault index`) after taking new snapshots, when switching
+`--embedder`, or when `find` prints a note that the index was built with
+different chunking settings.
+`find` always resolves each hit to the newest snapshot that still contains
+it, so an older index never points at a path that no longer exists.
+
+The model lives under `$SNAPVAULT_MODEL_DIR/<name>` when that variable is
+set, otherwise under the OS user cache directory
+(`os.UserCacheDir()/snapvault/models/<name>`).
+Its revision and every file's SHA-256 are pinned in
+`go/internal/model2vec/registry.go` and verified before use, the same way
+`java/Makefile` pins its one dependency.
 
 Text extraction covers UTF-8 text and simple PDFs (via `pdftotext` when
 it's on `PATH`, otherwise a small builtin extractor); anything else is
 skipped and counted as skipped.
 
-The default embedder stays `builtin` until an eval run justifies changing
-it — see the next section.
-
 ## Measuring retrieval quality: `snapvault eval`
 
-`snapvault eval run` scores `find`'s retrieval against a question set: each
-question names a passage (`highlight`) of a file that answers it, and the
-harness compares that passage's rune offsets against what was actually
-retrieved, reporting precision, recall, F-beta, IoU, and blob-level hit
-rate / MRR, overall and per question tag.
+"Semantic search" is a claim, so there is a harness to test it.
+A question set names, for each question, the exact passage (`highlight`)
+of a file that answers it.
+The harness runs the question through `find`'s ranking and measures how
+much of the retrieved text overlaps that passage, character by character,
+plus whether the right file was found at all.
 
-```console
-$ snapvault model pull potion-base-8M    # once, to try the static embedder
-$ snapvault eval run \
-    --corpus tests/golden/search/corpus \
-    --questions tests/golden/search/questions.jsonl \
-    --embedder static
+```text
+questions.jsonl ──► locate each highlight in ──► reference ranges ─┐
+                    the file's extracted text                      ├──► character overlap
+corpus dir ──► temp repo ──► index ──► Rank ──► retrieved ranges  ─┘           │
+      precision / recall / F-beta / IoU   (chunk level)           ◄────────────┤
+      Recall@k / MRR                      (file level)            ◄────────────┘
+      overall and per tag: lexical, semantic, hard
 ```
 
-`tests/golden/search/` is a committed ~50-document, ~100-question fixture
-(see its `MANIFEST.md`) that runs in CI as a quality floor for both
-embedders, recorded in `baseline.json`.
-`snapvault eval generate --model <ollama-model> --out <file>` builds a
-question file like it from your own repository's own files, via a local
-Ollama model, for scoring `find` against your own content instead.
-`docs/autoretrieval/` documents the tuning loop this harness feeds: an
-agent may edit `go/internal/search/pipeline.go` and nothing else, gated on
-`make eval`'s headline number actually improving.
+`tests/golden/search/` is a committed fixture: 50 original documents and
+100 questions, each tagged `lexical` (the answer shares the question's
+words), `semantic` (the question paraphrases — "automobile" vs "car"), or
+`hard` (a distractor document on the same topic).
+CI runs it as a quality floor for both embedders (`baseline.json`), so a
+change that makes retrieval worse fails the build.
+
+The first measurement (k=10, β=2, 100 questions):
+
+```text
+                       recall   MRR      semantic-tag recall   semantic-tag MRR
+builtin-lexical-v1     0.880    0.784    0.701                 0.593
+static:potion-base-8M  0.961    0.891    0.901                 0.802
+```
+
+Static embeddings find the paraphrased answers the keyword matcher misses,
+with no loss on keyword queries (both score 1.000 on `lexical` and
+`hard`).
+
+### Using the harness
+
+Score the golden set with both embedders:
+
+```console
+$ make eval
+embedder=static:potion-base-8M@f65d0f325faa k=10 beta=2.00
+
+overall    n=100  precision=0.071 recall=0.961 fbeta=0.269 iou=0.071 recall@k=0.990 mrr=0.891
+hard       n=20   ...
+lexical    n=40   ...
+semantic   n=40   ...
+```
+
+`precision`, `recall`, `fbeta`, and `iou` are character overlap between
+the retrieved chunks and the highlight; `recall@k` and `mrr` are whether,
+and how high, the right file appeared in the top `k`.
+Precision is low for every embedder because a 1200-rune chunk is much
+larger than a one-sentence highlight — read `recall` and `mrr`, and the per
+tag rows, to compare embedders.
+
+Score your own files instead of the fixture.
+This needs a local Ollama model to write the questions; the scoring itself
+never uses one:
+
+```console
+$ ollama pull llama3.2:3b
+$ go/build/snapvault -C ~/Documents/notes index --embedder static
+$ go/build/snapvault -C ~/Documents/notes eval generate \
+    --model llama3.2:3b --out ~/notes-questions.jsonl --per-file 2
+$ go/build/snapvault -C ~/Documents/notes eval run \
+    --questions ~/notes-questions.jsonl --embedder static
+```
+
+Generated questions carry no tag; add `"tags": ["semantic"]` and friends by
+hand if you want the per-tag rows.
+Every `highlight` must occur exactly once in its file's extracted text;
+`eval run` refuses a question set that breaks that rule rather than
+scoring it wrong.
+
+Let an agent tune the pipeline.
+`go/internal/search/pipeline.go` holds every tunable (chunk size and
+overlap, BM25 `k1`/`b`, fusion method and weights); the rules for changing
+it are in `docs/autoretrieval/program.md`:
+
+```text
+        ┌──────────────────────────────────────────────────────┐
+        │  edit pipeline.go  ──►  make test-go  ──►  make eval │
+        │        ▲                                       │     │
+        │        │     keep if FBeta@10 rose by ≥ 0.005 and no │
+        │        └──── tag's Recall@10 fell by > 0.02  ◄─────┘ │
+        │              (otherwise revert pipeline.go)          │
+        └──────────────────────────────────────────────────────┘
+           every run is logged to experiments.md; nothing is committed
+```
+
+Point a coding agent at that file ("read `docs/autoretrieval/program.md`
+and run one experiment") and review `experiments.md` and the working tree
+afterwards.
 
 ## Commands
 
