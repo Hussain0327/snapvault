@@ -50,10 +50,10 @@ bool ReadTextFile(const std::filesystem::path& path, std::string* content) {
 // Walks one repository and accumulates findings.
 class Checker {
  public:
-  Checker(const std::filesystem::path& root, std::ostream& out)
-      : metadata_(root / ".snapvault"),
-        objects_(metadata_ / "objects"),
-        out_(out) {}
+  // metadata is the repository's metadata directory: root/.snapvault for
+  // an ordinary repository, or a detached checkpoint store itself.
+  Checker(const std::filesystem::path& metadata, std::ostream& out)
+      : metadata_(metadata), objects_(metadata_ / "objects"), out_(out) {}
 
   int Run() {
     if (CheckLayout()) {
@@ -79,8 +79,12 @@ class Checker {
   bool CheckLayout() {
     std::error_code ec;
     if (!std::filesystem::is_directory(metadata_, ec)) {
-      Error("not a SnapVault repository (no .snapvault directory): " +
-            metadata_.parent_path().string());
+      if (metadata_.filename() == ".snapvault") {
+        Error("not a SnapVault repository (no .snapvault directory): " +
+              metadata_.parent_path().string());
+      } else {
+        Error("not a SnapVault checkpoint store: " + metadata_.string());
+      }
       return false;
     }
     std::string format;
@@ -319,7 +323,12 @@ class Checker {
 }  // namespace
 
 int RunFsck(const std::filesystem::path& root, std::ostream& out) {
-  Checker checker(root, out);
+  Checker checker(root / ".snapvault", out);
+  return checker.Run();
+}
+
+int RunFsckStore(const std::filesystem::path& store, std::ostream& out) {
+  Checker checker(store, out);
   return checker.Run();
 }
 

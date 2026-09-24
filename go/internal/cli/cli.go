@@ -81,14 +81,21 @@ func execute(args []string, out, errOut io.Writer, workdir string) error {
 	if err != nil {
 		return err
 	}
+	loc := location{}
 	i := 0
-	for i < len(args) && args[i] == "-C" {
+	for i < len(args) && (args[i] == "-C" || args[i] == "--store") {
 		if i+1 >= len(args) {
-			return usageError{"-C requires a directory"}
+			return usageError{args[i] + " requires a directory"}
 		}
-		directory = resolve(directory, args[i+1])
+		if args[i] == "-C" {
+			directory = resolve(directory, args[i+1])
+			loc.directoryGiven = true
+		} else {
+			loc.store = resolve(directory, args[i+1])
+		}
 		i += 2
 	}
+	loc.directory = directory
 	if i >= len(args) {
 		printUsage(out)
 		return nil
@@ -96,21 +103,24 @@ func execute(args []string, out, errOut io.Writer, workdir string) error {
 
 	command := strings.ToLower(args[i])
 	rest := args[i+1:]
+	if loc.store != "" && !storeCommands[command] {
+		return usageError{"--store is not supported by " + command}
+	}
 	switch command {
 	case "init":
 		return runInit(out, directory, rest)
 	case "snapshot", "commit":
-		return runSnapshot(out, directory, rest)
+		return runSnapshot(out, loc, rest)
 	case "log":
-		return runLog(out, directory, rest)
+		return runLog(out, loc, rest)
 	case "diff":
-		return runDiff(out, directory, rest)
+		return runDiff(out, loc, rest)
 	case "restore":
-		return runRestore(out, directory, rest)
+		return runRestore(out, loc, rest)
 	case "upgrade":
-		return runUpgrade(out, directory, rest)
+		return runUpgrade(out, loc, rest)
 	case "repack":
-		return runRepack(out, directory, rest)
+		return runRepack(out, loc, rest)
 	case "index":
 		return runIndex(out, directory, rest)
 	case "find":
@@ -119,6 +129,8 @@ func execute(args []string, out, errOut io.Writer, workdir string) error {
 		return runModel(out, errOut, rest)
 	case "eval":
 		return runEval(out, errOut, directory, rest)
+	case "mcp":
+		return runMCP(out, loc, rest)
 	case "help", "--help", "-h":
 		if len(rest) > 0 {
 			return usageError{"help does not accept arguments"}
@@ -134,6 +146,34 @@ func execute(args []string, out, errOut io.Writer, workdir string) error {
 	default:
 		return usageError{"unknown command: " + command}
 	}
+}
+
+// storeCommands are the commands that accept the global --store option.
+var storeCommands = map[string]bool{
+	"snapshot": true, "commit": true, "log": true, "diff": true,
+	"restore": true, "upgrade": true, "repack": true, "mcp": true,
+}
+
+// location says where a command's repository lives: an ordinary repository
+// found at or above directory, or, with store set, a checkpoint store kept
+// outside the folder it protects.
+type location struct {
+	directory      string
+	directoryGiven bool
+	store          string
+}
+
+// open opens the repository loc names. With a store and no -C, the store's
+// recorded folder is used; with both, they must agree.
+func (loc location) open() (*repo.Repository, error) {
+	if loc.store == "" {
+		return repo.Open(loc.directory)
+	}
+	root := ""
+	if loc.directoryGiven {
+		root = loc.directory
+	}
+	return repo.OpenStore(loc.store, root)
 }
 
 func runInit(out io.Writer, directory string, args []string) error {
@@ -152,7 +192,7 @@ func runInit(out io.Writer, directory string, args []string) error {
 	return nil
 }
 
-func runSnapshot(out io.Writer, directory string, args []string) error {
+func runSnapshot(out io.Writer, loc location, args []string) error {
 	message := "Snapshot"
 	workers := 0
 	for i := 0; i < len(args); i++ {
@@ -185,7 +225,7 @@ func runSnapshot(out io.Writer, directory string, args []string) error {
 		}
 	}
 
-	r, err := repo.Open(directory)
+	r, err := loc.open()
 	if err != nil {
 		return err
 	}
@@ -198,7 +238,7 @@ func runSnapshot(out io.Writer, directory string, args []string) error {
 	return nil
 }
 
-func runLog(out io.Writer, directory string, args []string) error {
+func runLog(out io.Writer, loc location, args []string) error {
 	oneline := false
 	limit := defaultLogLimit
 	revision := "HEAD"
@@ -232,7 +272,7 @@ func runLog(out io.Writer, directory string, args []string) error {
 		}
 	}
 
-	r, err := repo.Open(directory)
+	r, err := loc.open()
 	if err != nil {
 		return err
 	}
@@ -268,7 +308,7 @@ func runLog(out io.Writer, directory string, args []string) error {
 	return nil
 }
 
-func runDiff(out io.Writer, directory string, args []string) error {
+func runDiff(out io.Writer, loc location, args []string) error {
 	for _, arg := range args {
 		if strings.HasPrefix(arg, "-") {
 			return usageError{"unknown diff option: " + arg}
@@ -278,7 +318,7 @@ func runDiff(out io.Writer, directory string, args []string) error {
 		return usageError{"diff accepts at most two snapshot revisions"}
 	}
 
-	r, err := repo.Open(directory)
+	r, err := loc.open()
 	if err != nil {
 		return err
 	}
@@ -314,7 +354,7 @@ func runDiff(out io.Writer, directory string, args []string) error {
 	return nil
 }
 
-func runRestore(out io.Writer, directory string, args []string) error {
+func runRestore(out io.Writer, loc location, args []string) error {
 	force := false
 	target := ""
 	revision := ""
@@ -327,9 +367,9 @@ func runRestore(out io.Writer, directory string, args []string) error {
 			if i++; i >= len(args) {
 				return usageError{"--to requires a directory"}
 			}
-			target = resolve(directory, args[i])
+			target = resolve(loc.directory, args[i])
 		case strings.HasPrefix(arg, "--to="):
-			target = resolve(directory, arg[len("--to="):])
+			target = resolve(loc.directory, arg[len("--to="):])
 		case strings.HasPrefix(arg, "-"):
 			return usageError{"unknown restore option: " + arg}
 		case revision == "":
@@ -342,7 +382,7 @@ func runRestore(out io.Writer, directory string, args []string) error {
 		return usageError{"restore requires a snapshot revision"}
 	}
 
-	r, err := repo.Open(directory)
+	r, err := loc.open()
 	if err != nil {
 		return err
 	}
@@ -361,11 +401,11 @@ func runRestore(out io.Writer, directory string, args []string) error {
 	return nil
 }
 
-func runUpgrade(out io.Writer, directory string, args []string) error {
+func runUpgrade(out io.Writer, loc location, args []string) error {
 	if len(args) > 0 {
 		return usageError{"upgrade accepts no arguments"}
 	}
-	r, err := repo.Open(directory)
+	r, err := loc.open()
 	if err != nil {
 		return err
 	}
@@ -381,7 +421,7 @@ func runUpgrade(out io.Writer, directory string, args []string) error {
 	return nil
 }
 
-func runRepack(out io.Writer, directory string, args []string) error {
+func runRepack(out io.Writer, loc location, args []string) error {
 	dryRun := false
 	for _, arg := range args {
 		if arg != "--dry-run" {
@@ -390,7 +430,7 @@ func runRepack(out io.Writer, directory string, args []string) error {
 		dryRun = true
 	}
 
-	r, err := repo.Open(directory)
+	r, err := loc.open()
 	if err != nil {
 		return err
 	}
@@ -1023,7 +1063,10 @@ func printUsage(out io.Writer) {
 	fmt.Fprintln(out, "  snapvault [-C directory] eval run --questions <file> [--corpus <dir>]")
 	fmt.Fprintln(out, "      [--embedder ...] [-k n] [--beta f] [--pct n] [--json]")
 	fmt.Fprintln(out, "  snapvault [-C directory] eval generate --model <ollama-model> --out <file> [--per-file n]")
+	fmt.Fprintln(out, "  snapvault [-C directory] mcp [--store directory] [--interval duration] [--ignore name]...")
 	fmt.Fprintln(out)
+	fmt.Fprintln(out, "--store <directory> runs snapshot, log, diff, restore, upgrade, repack, or mcp")
+	fmt.Fprintln(out, "against a checkpoint store kept outside the folder (see mcp).")
 	fmt.Fprintln(out, "Revisions can be HEAD, HEAD~N, a full SHA-256 id, or a 7+ character prefix.")
 	fmt.Fprintln(out, "With no revisions, diff compares HEAD to the working directory.")
 	fmt.Fprintln(out, "With one revision, diff compares that snapshot to the working directory.")

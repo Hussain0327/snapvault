@@ -328,11 +328,103 @@ Point a coding agent at that file ("read `docs/autoretrieval/program.md`
 and run one experiment") and review `experiments.md` and the working tree
 afterwards.
 
+## Undo for AI agents: `snapvault mcp`
+
+Coding and computer-use agents edit real folders, and their built-in
+checkpoints miss a lot.
+Claude Code's own documentation lists what `/rewind` cannot undo: files
+changed by Bash commands (`rm`, `mv`, `cp`), edits made by subagents,
+changes made outside the session, and symlinked files.
+`snapvault mcp` covers all of those, for any folder, with any agent that
+speaks the [Model Context Protocol](https://modelcontextprotocol.io).
+
+```text
+agent ──stdin/stdout──► snapvault mcp ──► checkpoint store (outside the folder)
+                           │                    ▲
+                           ├── timer: checkpoint if anything changed
+                           └── tools: checkpoint, list_checkpoints, diff, restore
+```
+
+The agent's client starts `snapvault mcp` for the session, and it stops
+when the session ends.
+It checkpoints the folder at startup and then every few seconds, writing a
+checkpoint only when something changed, so a file deleted from a shell is
+caught even if the agent never calls a tool.
+A checkpoint is an ordinary SnapVault commit, deduplicated like any other,
+so a quiet folder costs nothing and a busy one costs only the bytes that
+changed.
+When a scan takes long, the timer backs off to at least ten times the scan
+time.
+
+Four tools are exposed to the agent:
+
+- `checkpoint`: record the folder now, with a reason ("before deleting
+  build outputs").
+- `list_checkpoints`: recent checkpoints with id, time, and reason.
+- `diff`: which paths changed between a checkpoint and now, or between two
+  checkpoints.
+- `restore`: return some paths, or the whole folder, to a checkpoint.
+  The current state is checkpointed first and reported, so every restore
+  can itself be undone.
+
+Two design choices keep the undo trustworthy:
+
+- The checkpoint store lives outside the protected folder (by default under
+  `~/Library/Application Support/snapvault/stores/` on macOS and
+  `~/.local/share/snapvault/stores/` elsewhere), so an agent's `rm -rf` on
+  the folder cannot take its history with it.
+  The store records which folder it protects and refuses any other.
+- Object writes are fsync'd before the rename that publishes them, so a
+  crash right after a checkpoint cannot leave a corrupt object behind.
+
+The protocol layer is written from scratch on the Go standard library
+(`go/internal/mcp`): the initialize handshake with version negotiation,
+`ping`, `tools/list`, and `tools/call`.
+It adds no dependencies; the official Go SDK would have brought in eight
+more modules, OAuth2 included, for a server that never touches the network.
+
+### Using it
+
+Register it with Claude Code for the folder you want protected:
+
+```console
+$ make go
+$ claude mcp add snapvault -- "$PWD/go/build/snapvault" -C ~/Documents/project \
+    mcp --ignore node_modules --ignore .git
+```
+
+`--ignore` names a file or directory to leave out of checkpoints at any
+depth; ignored entries are never snapshotted and never touched by a
+restore.
+Ignore rules exist only in these checkpoint stores, never in an ordinary
+repository, so the three implementations still agree on every tree id.
+
+A session, driven over the real stdio protocol, where the agent deletes a
+file from a shell and then undoes it:
+
+```text
+list_checkpoints  e20cc8f4c64c  2026-09-24 16:27:19  auto: timer
+                  5920759dba58  2026-09-24 16:27:18  auto: session start
+diff              D photos.txt
+restore           Restored photos.txt to checkpoint 5920759dba58.
+                  To undo this, restore checkpoint e20cc8f4c64c.
+```
+
+You can inspect the same checkpoints yourself with the global `--store`
+option, and verify them with the C++ checker:
+
+```console
+$ go/build/snapvault --store <store> log --oneline
+$ go/build/snapvault --store <store> diff
+$ cpp/build/snapvault-fsck --store <store>
+checked 5 objects: 0 errors, 0 warnings
+```
+
 ## Commands
 
 The Java and Go CLIs take the same commands and print the same output for
 everything both of them implement; `upgrade`, `repack`, `index`, `find`,
-`model`, and `eval` are Go-only, per the format v2 design.
+`model`, `eval`, and `mcp` are Go-only, per the format v2 design.
 
 ```text
 snapvault init [directory]
@@ -350,6 +442,8 @@ snapvault [-C directory] eval run --questions <file> [--corpus <dir>]
     [--embedder ...] [-k n] [--beta f] [--pct n] [--json]
 snapvault [-C directory] eval generate --model <ollama-model> --out <file>
     [--per-file n]
+snapvault [-C directory] mcp [--store dir] [--interval 5s] [--ignore name]...
+snapvault --store <dir> snapshot|log|diff|restore|upgrade|repack ...
 ```
 
 Revisions are `HEAD`, `HEAD~2`, a full id, or a 7+ character prefix.
@@ -400,7 +494,8 @@ workers=8     8.5 ms    3.7 GB/s
 
 ## The C++ verifier
 
-`snapvault-fsck <directory>` is read-only.
+`snapvault-fsck <directory>` (or `snapvault-fsck --store <store>` for an
+agent checkpoint store) is read-only.
 It walks every ref, inflates every reachable object, recomputes every
 SHA-256, and validates tree and commit payloads against the spec.
 Corruption, truncation, or a missing object → exit 1.

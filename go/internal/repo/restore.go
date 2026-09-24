@@ -83,7 +83,11 @@ func (r *Repository) Restore(revision string, target string, force bool) error {
 	if inPlace {
 		preserved = r.metadata
 	}
-	if err := clearDirectory(resolved, preserved); err != nil {
+	clear := clearDirectory
+	if inPlace {
+		clear = r.clearKeepingIgnored
+	}
+	if err := clear(resolved, preserved); err != nil {
 		return err
 	}
 	if err := r.materializeTree(commit.TreeID, resolved); err != nil {
@@ -377,8 +381,14 @@ func (r *Repository) materializeTree(treeID string, directory string) error {
 		if filepath.Dir(destination) != directory {
 			return fmt.Errorf("unsafe path in snapshot: %s", entry.Name)
 		}
-		if _, err := os.Lstat(destination); err == nil {
-			return fmt.Errorf("two entries in this snapshot resolve to the same file: %s", destination)
+		if info, err := os.Lstat(destination); err == nil {
+			// A directory kept only because it holds ignored entries is
+			// filled in rather than treated as a name collision.
+			keptForIgnored := len(r.ignore) > 0 && entry.Kind == object.KindDirectory &&
+				info.IsDir() && info.Mode()&os.ModeSymlink == 0
+			if !keptForIgnored {
+				return fmt.Errorf("two entries in this snapshot resolve to the same file: %s", destination)
+			}
 		}
 		switch entry.Kind {
 		case object.KindDirectory:

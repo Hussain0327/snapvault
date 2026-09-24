@@ -510,6 +510,7 @@ const GoldenDeltaRejectCase kGoldenDeltaRejectCases[] = {
     {"reject/04-reserved-opcode-zero", "reserved opcode 0x00"},
     {"reject/05-src-size-mismatch", "delta source size mismatch"},
     {"reject/06-tgt-size-mismatch", "delta target size mismatch"},
+    {"reject/07-oversized-varint-header", "exceeds the maximum"},
 };
 
 void TestGoldenDeltaVectorsRejectMalformed() {
@@ -1026,6 +1027,22 @@ void TestFsckAcceptsFormatOneAndTwo() {
   }
 }
 
+void TestFsckVerifiesADetachedStore() {
+  const fs::path root =
+      fs::temp_directory_path() / ("sv-store-" + NextTempSuffix());
+  fs::remove_all(root);
+  InitFixtureRepo(root, "snapvault 2");
+  std::ostringstream out;
+  EXPECT(snapvault::RunFsckStore(root / ".snapvault", out) == 0);
+  EXPECT(out.str().find("0 errors") != std::string::npos);
+
+  std::ostringstream missing;
+  EXPECT(snapvault::RunFsckStore(root / "not-a-store", missing) == 1);
+  EXPECT(missing.str().find("not a SnapVault checkpoint store") !=
+         std::string::npos);
+  fs::remove_all(root);
+}
+
 void TestFsckRejectsUnsupportedFormat() {
   const fs::path root = fs::temp_directory_path() /
                         ("sv-fmt3-" + NextTempSuffix());
@@ -1277,6 +1294,7 @@ int main() {
   TestReadObjectDeltaAgainstLegacyBaseUsesRawHeaderBytes();
   TestFsckAcceptsFormatOneAndTwo();
   TestFsckRejectsUnsupportedFormat();
+  TestFsckVerifiesADetachedStore();
   TestFsckAcceptsMixedLegacyAndContainerInV2Repo();
   TestFsckFlagsContainerObjectInV1Repo();
   TestFsckFlagsMissingDeltaBase();

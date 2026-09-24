@@ -102,7 +102,7 @@ func (r *Repository) walk(
 	var names []string
 	for _, entry := range listing {
 		child := filepath.Join(dir, entry.Name())
-		if child == r.metadata || isRepositoryMetadata(child, entry.Name()) {
+		if child == r.metadata || isRepositoryMetadata(child, entry.Name()) || r.ignored(entry.Name()) {
 			continue
 		}
 		names = append(names, entry.Name())

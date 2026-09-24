@@ -44,6 +44,9 @@ type Repository struct {
 	now func() time.Time
 	// workers bounds the hashing pool; 0 means one worker per CPU.
 	workers int
+	// ignore holds entry names skipped at any depth. Only detached
+	// checkpoint stores have one; see SetIgnore.
+	ignore map[string]bool
 }
 
 // Init initializes a repository in an existing or new ordinary directory.
@@ -67,18 +70,109 @@ func Init(directory string) (*Repository, error) {
 	if err := os.Mkdir(metadata, 0o755); err != nil {
 		return nil, err
 	}
-	for _, dir := range []string{"objects", filepath.Join("refs", "heads")} {
-		if err := os.MkdirAll(filepath.Join(metadata, dir), 0o755); err != nil {
-			return nil, err
-		}
-	}
-	if err := os.WriteFile(filepath.Join(metadata, "format"), []byte(formatLine+"\n"), 0o644); err != nil {
-		return nil, err
-	}
-	if err := os.WriteFile(filepath.Join(metadata, "HEAD"), []byte("ref: "+defaultRef+"\n"), 0o644); err != nil {
+	if err := writeLayout(metadata, formatLine); err != nil {
 		return nil, err
 	}
 	return openAt(root)
+}
+
+// writeLayout creates the objects and refs directories, the format marker,
+// and HEAD inside an existing, empty metadata directory.
+func writeLayout(metadata string, format string) error {
+	for _, dir := range []string{"objects", filepath.Join("refs", "heads")} {
+		if err := os.MkdirAll(filepath.Join(metadata, dir), 0o755); err != nil {
+			return err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(metadata, "format"), []byte(format+"\n"), 0o644); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(metadata, "HEAD"), []byte("ref: "+defaultRef+"\n"), 0o644)
+}
+
+// worktreeFile names the file inside a detached store that records which
+// folder the store protects.
+const worktreeFile = "worktree"
+
+// OpenDetached opens, creating on first use, a repository whose metadata
+// lives in storeDir instead of root/.snapvault. storeDir must lie outside
+// root, so deleting everything in root can never delete its history too.
+// A new detached store starts at format 2. The store records root and
+// refuses to be opened for any other folder.
+func OpenDetached(root string, storeDir string) (*Repository, error) {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(absRoot, 0o755); err != nil {
+		return nil, err
+	}
+	realRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return nil, err
+	}
+	absStore, err := filepath.Abs(storeDir)
+	if err != nil {
+		return nil, err
+	}
+	realStore, err := canonicalizeTarget(absStore)
+	if err != nil {
+		return nil, err
+	}
+	if isWithin(realRoot, realStore) || isWithin(realStore, realRoot) {
+		return nil, fmt.Errorf("the checkpoint store must be outside the folder it protects: %s", realStore)
+	}
+
+	recorded, err := os.ReadFile(filepath.Join(realStore, worktreeFile))
+	switch {
+	case err == nil:
+		if owner := strings.TrimSuffix(string(recorded), "\n"); owner != realRoot {
+			return nil, fmt.Errorf("checkpoint store %s belongs to %s, not %s", realStore, owner, realRoot)
+		}
+	case errors.Is(err, os.ErrNotExist):
+		if err := createDetached(realStore, realRoot); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, err
+	}
+	return openWith(realRoot, realStore)
+}
+
+// OpenStore opens an existing detached store. With root empty it opens the
+// folder the store records; otherwise root must be that folder.
+func OpenStore(storeDir string, root string) (*Repository, error) {
+	recorded, err := os.ReadFile(filepath.Join(storeDir, worktreeFile))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("not a checkpoint store: %s", storeDir)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if root == "" {
+		root = strings.TrimSuffix(string(recorded), "\n")
+	}
+	return OpenDetached(root, storeDir)
+}
+
+// createDetached lays out a new detached store, refusing a directory that
+// already holds anything, and writes the worktree record last so a store
+// interrupted mid-creation is never mistaken for a finished one.
+func createDetached(storeDir string, root string) error {
+	if err := os.MkdirAll(storeDir, 0o755); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(storeDir)
+	if err != nil {
+		return err
+	}
+	if len(entries) > 0 {
+		return fmt.Errorf("refusing to create a checkpoint store in a non-empty directory: %s", storeDir)
+	}
+	if err := writeLayout(storeDir, fmt.Sprintf("snapvault %d", maxFormatVersion)); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(storeDir, worktreeFile), []byte(root+"\n"), 0o644)
 }
 
 // Open finds a repository at or above start, so commands also work in
@@ -115,7 +209,12 @@ func openAt(root string) (*Repository, error) {
 	if err != nil {
 		return nil, err
 	}
-	metadata := filepath.Join(realRoot, MetadataDirName)
+	return openWith(realRoot, filepath.Join(realRoot, MetadataDirName))
+}
+
+// openWith opens the repository whose work tree is realRoot and whose
+// metadata directory is metadata; both must already be resolved paths.
+func openWith(realRoot string, metadata string) (*Repository, error) {
 	format, err := os.ReadFile(filepath.Join(metadata, "format"))
 	if err != nil {
 		return nil, err
@@ -132,7 +231,13 @@ func openAt(root string) (*Repository, error) {
 		return nil, err
 	}
 	s.SetFormat(store.Format(version))
-	return &Repository{root: realRoot, metadata: metadata, store: s, version: version, now: time.Now}, nil
+	ignore, err := loadIgnore(metadata)
+	if err != nil {
+		return nil, err
+	}
+	return &Repository{
+		root: realRoot, metadata: metadata, store: s, version: version, now: time.Now, ignore: ignore,
+	}, nil
 }
 
 // parseFormatVersion extracts the version number from a ".snapvault/format"
@@ -160,47 +265,71 @@ func (r *Repository) SetWorkers(workers int) { r.workers = workers }
 // Snapshot creates an immutable snapshot commit and advances the current
 // branch atomically, returning the new commit id.
 func (r *Repository) Snapshot(message string) (string, error) {
+	id, _, err := r.snapshot(message, false)
+	return id, err
+}
+
+// SnapshotIfChanged snapshots like Snapshot, except that when the working
+// tree matches the current snapshot's tree it writes no commit and returns
+// the current commit id with created false.
+func (r *Repository) SnapshotIfChanged(message string) (id string, created bool, err error) {
+	return r.snapshot(message, true)
+}
+
+func (r *Repository) snapshot(message string, skipUnchanged bool) (string, bool, error) {
 	normalized := strings.TrimSpace(message)
 	if normalized == "" {
-		return "", errors.New("snapshot message cannot be empty")
+		return "", false, errors.New("snapshot message cannot be empty")
 	}
 
 	lock, err := acquireLock(filepath.Join(r.metadata, "lock"))
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer lock.close()
 	if err := r.requireCompleteWorkingTree(); err != nil {
-		return "", err
+		return "", false, err
 	}
 
 	treeID, _, files, err := r.scanWorking(storingSink{store: r.store})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	var parents []string
 	head, err := r.Head()
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if head != "" {
 		parents = []string{head}
+		if skipUnchanged {
+			current, err := r.ReadCommit(head)
+			if err != nil {
+				return "", false, err
+			}
+			if current.TreeID == treeID {
+				if err := r.writeDirCache(files); err != nil {
+					return "", false, err
+				}
+				return head, false, nil
+			}
+		}
 	}
 	commit, err := object.NewCommit(treeID, parents, r.now(), normalized)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	commitID, err := r.store.Put(object.TypeCommit, commit.Encode())
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if err := r.writeDirCache(files); err != nil {
-		return "", err
+		return "", false, err
 	}
 	if err := r.writeCurrentRef(commitID); err != nil {
-		return "", err
+		return "", false, err
 	}
-	return commitID, nil
+	return commitID, true, nil
 }
 
 // Head returns the current commit id, or "" before the first snapshot.
