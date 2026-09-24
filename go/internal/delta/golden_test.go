@@ -40,6 +40,7 @@ var rejectCases = map[string]string{
 	"04-reserved-opcode-zero":    "opcode 0x00 is invalid",
 	"05-src-size-mismatch":       "does not match base length",
 	"06-tgt-size-mismatch":       "want tgtSize",
+	"07-oversized-varint-header": "exceeds the 268435456 byte cap",
 }
 
 func TestGoldenVectorsApplyToTarget(t *testing.T) {

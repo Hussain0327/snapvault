@@ -85,6 +85,9 @@ directory, and an accept case is never placed under `reject/`.
 - `05-src-size-mismatch` — `srcSize` declares 11 against a 10-byte base.
 - `06-tgt-size-mismatch` — `tgtSize` declares 10, but the one insert
   instruction in the stream only produces 3 bytes before the stream ends.
+- `07-oversized-varint-header` — `tgtSize` is a 10-byte varint whose last
+  byte lands on bit 63. A decoder that accumulates into a signed 64-bit
+  integer reads a negative size that slips under any positive size cap.
 
 ### Regenerating the reject cases
 
@@ -124,6 +127,10 @@ delta = varint(11) + varint(0)
 # 06-tgt-size-mismatch
 base = b"hello"
 delta = varint(5) + varint(10) + bytes([0x03]) + b"abc"
+
+# 07-oversized-varint-header
+base = b"abc"
+delta = varint(3) + bytes([0xFF] * 9 + [0x01]) + bytes([0x03]) + b"abc"
 ```
 
 Each was verified by hand against all three decoders' source

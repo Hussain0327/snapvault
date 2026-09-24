@@ -118,6 +118,12 @@ final class DeltaApplier {
             int shift = 0;
             while (true) {
                 int next = readByte();
+                // At shift 63 only bit 0 would land in the long, and it would land in the sign
+                // bit: any nonzero group there is a size no object can have. Refusing it keeps
+                // every decoded size non-negative, so the maximum-size check cannot be bypassed.
+                if (shift == 63 && (next & 0x7f) != 0) {
+                    throw new IOException("delta varint is too large");
+                }
                 value |= ((long) (next & 0x7f)) << shift;
                 if ((next & 0x80) == 0) {
                     return value;

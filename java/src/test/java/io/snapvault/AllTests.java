@@ -1388,7 +1388,8 @@ public final class AllTests {
                     Map.entry("03-truncated-varint-header", "ends mid-instruction"),
                     Map.entry("04-reserved-opcode-zero", "reserved opcode 0x00"),
                     Map.entry("05-src-size-mismatch", "does not match base object size"),
-                    Map.entry("06-tgt-size-mismatch", "delta stream produced"));
+                    Map.entry("06-tgt-size-mismatch", "delta stream produced"),
+                    Map.entry("07-oversized-varint-header", "delta varint is too large"));
 
     private static Path requireGoldenDeltaDir() throws IOException {
         if (!Files.isDirectory(GOLDEN_DELTA_DIR)) {

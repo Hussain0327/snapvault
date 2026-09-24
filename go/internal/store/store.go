@@ -181,6 +181,10 @@ func (s *Store) writeLegacy(t object.Type, payloadSize int64, payload io.Reader)
 		tmp.Close()
 		return "", err
 	}
+	if err := syncFile(tmp); err != nil {
+		tmp.Close()
+		return "", err
+	}
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}
@@ -216,16 +220,44 @@ func (s *Store) finalizeObject(tmpPath, id string) (result string, renamed bool,
 		}
 		return id, false, nil
 	}
-	if err := os.MkdirAll(filepath.Dir(destination), 0o755); err != nil {
+	shard := filepath.Dir(destination)
+	_, statErr := os.Stat(shard)
+	newShard := errors.Is(statErr, os.ErrNotExist)
+	if err := os.MkdirAll(shard, 0o755); err != nil {
 		return "", false, err
 	}
 	// Rename is atomic on POSIX; a concurrent writer landing first leaves
-	// identical bytes, so replacement is harmless.
+	// identical bytes, so replacement is harmless. The caller already synced
+	// the temporary file's data, so the rename can never publish a name for
+	// bytes that are not yet durable; syncing the shard directory afterwards
+	// makes the name itself survive a crash.
 	if err := os.Rename(tmpPath, destination); err != nil {
 		return "", false, err
 	}
+	if err := syncDir(shard); err != nil {
+		return "", true, err
+	}
+	if newShard {
+		if err := syncDir(filepath.Dir(shard)); err != nil {
+			return "", true, err
+		}
+	}
 	return id, true, nil
 }
+
+// syncFile and syncDir flush data and directory entries to stable storage.
+// They are variables so tests can observe the order of durability steps.
+var (
+	syncFile = (*os.File).Sync
+	syncDir  = func(path string) error {
+		dir, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer dir.Close()
+		return dir.Sync()
+	}
+)
 
 // Get reads an object whole, verifying its envelope and digest.
 func (s *Store) Get(id string) (object.Type, []byte, error) {

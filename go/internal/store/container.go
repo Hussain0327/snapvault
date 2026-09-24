@@ -119,6 +119,10 @@ func (s *Store) writeContainerFullZstd(t object.Type, payloadSize int64, payload
 		tmp.Close()
 		return "", err
 	}
+	if err := syncFile(tmp); err != nil {
+		tmp.Close()
+		return "", err
+	}
 	if err := tmp.Close(); err != nil {
 		return "", err
 	}

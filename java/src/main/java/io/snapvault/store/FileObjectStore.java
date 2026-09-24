@@ -10,6 +10,8 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.channels.Channels;
+import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.DirectoryStream;
@@ -18,6 +20,7 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.security.DigestInputStream;
 import java.util.ArrayList;
@@ -116,8 +119,9 @@ public final class FileObjectStore implements ObjectStore {
         long copied = 0;
 
         try {
-            try (OutputStream fileOutput = Files.newOutputStream(temporary);
-                    DeflaterOutputStream compressed = new DeflaterOutputStream(fileOutput)) {
+            try (FileChannel channel = FileChannel.open(temporary, StandardOpenOption.WRITE);
+                    DeflaterOutputStream compressed =
+                            new DeflaterOutputStream(Channels.newOutputStream(channel))) {
                 digest.update(header);
                 compressed.write(header);
 
@@ -128,6 +132,10 @@ public final class FileObjectStore implements ObjectStore {
                     compressed.write(buffer, 0, read);
                     copied += read;
                 }
+                // The data must be durable before the rename publishes it under its id, or a
+                // crash could leave a truncated file at a path a tree already references.
+                compressed.finish();
+                channel.force(true);
             }
 
             if (copied != payloadSize) {
@@ -148,14 +156,27 @@ public final class FileObjectStore implements ObjectStore {
                 return objectId;
             }
 
-            Files.createDirectories(destination.getParent());
+            Path shard = destination.getParent();
+            boolean newShard = !Files.isDirectory(shard);
+            Files.createDirectories(shard);
             moveWithoutReplacing(temporary, destination);
             temporary = null;
+            forceDirectory(shard);
+            if (newShard) {
+                forceDirectory(objectsDirectory);
+            }
             return objectId;
         } finally {
             if (temporary != null) {
                 Files.deleteIfExists(temporary);
             }
+        }
+    }
+
+    /** Makes a directory's entries, such as a just-renamed object, survive a crash. */
+    private static void forceDirectory(Path directory) throws IOException {
+        try (FileChannel channel = FileChannel.open(directory, StandardOpenOption.READ)) {
+            channel.force(true);
         }
     }
 
