@@ -1,0 +1,87 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="464" viewBox="0 0 860 464" role="img" aria-labelledby="demo-title demo-desc">
+  <title id="demo-title">SnapVault demo: snapshot a folder, delete part of it, restore it</title>
+  <desc id="demo-desc">$ snapvault init ~/notes. Initialized empty SnapVault repository in ~/notes/.snapvault.
+$ snapvault -C ~/notes snapshot -m "before cleanup". Snapshot f810a15fb5ed before cleanup.
+$ rm -rf ~/notes/drafts.
+$ snapvault -C ~/notes diff. D drafts/launch-email.md. D drafts/q3-plan.md. 2 changes.
+$ snapvault -C ~/notes restore HEAD --force. Restored f810a15fb5ed to ~/notes.
+$ java/snapvault -C ~/notes diff, the Java build. No changes.
+$ snapvault-fsck ~/notes, the C++ checker. checked 8 objects: 0 errors, 0 warnings.</desc>
+  <style>
+    text {
+      font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 14px;
+      fill: #aab6c8;
+    }
+    .title { fill: #8391a8; font-size: 13px; }
+    .p { fill: #5fa8ff; }
+    .c { fill: #eef2f8; }
+    .m { fill: #7d8ba3; }
+    .id { fill: #e8c070; }
+    .del { fill: #ff8b82; }
+    .ok { fill: #68d89b; }
+    .l { opacity: 0; animation: show 0.01s forwards; }
+    .cover { fill: #1c2433; }
+    .cursor { fill: #eef2f8; opacity: 0; animation: show 0.01s 13.7s forwards, blink 1s steps(2, jump-none) 13.7s 6; }
+    @keyframes show { to { opacity: 1; } }
+    @keyframes blink { from { opacity: 1; } to { opacity: 0; } }
+    @keyframes t1 { to { transform: translateX(196px); } }
+    @keyframes t2 { to { transform: translateX(419px); } }
+    @keyframes t3 { to { transform: translateX(187px); } }
+    @keyframes t4 { to { transform: translateX(221px); } }
+    @keyframes t5 { to { transform: translateX(359px); } }
+    @keyframes t6 { to { transform: translateX(264px); } }
+    @keyframes t7 { to { transform: translateX(196px); } }
+    @media (prefers-reduced-motion: reduce) {
+      .l, .cursor { animation: none; opacity: 1; }
+      .cover { display: none; }
+    }
+  </style>
+  <defs>
+    <clipPath id="body">
+      <rect x="1" y="37" width="858" height="426"/>
+    </clipPath>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="859" height="463" rx="10" fill="#1c2433" stroke="#33415a"/>
+  <path d="M10.5 0.5h839a10 10 0 0 1 10 10v26h-859v-26a10 10 0 0 1 10-10z" fill="#232d3f"/>
+  <path d="M0.5 36.5h859" stroke="#2e3a50"/>
+  <text class="title" x="430" y="23" text-anchor="middle">~/notes</text>
+
+  <g clip-path="url(#body)">
+    <text class="l" x="24" y="78" style="animation-delay:0.3s"><tspan class="p">$</tspan> <tspan class="c">snapvault init ~/notes</tspan></text>
+    <rect class="cover" x="40" y="61" width="196" height="24" style="animation:t1 0.77s steps(22) 0.35s forwards"/>
+    <text class="l" x="24" y="102" style="animation-delay:1.4s">Initialized empty SnapVault repository in ~/notes/.snapvault</text>
+
+    <text class="l" x="24" y="126" style="animation-delay:1.9s"><tspan class="p">$</tspan> <tspan class="c">snapvault -C ~/notes snapshot -m "before cleanup"</tspan></text>
+    <rect class="cover" x="40" y="109" width="419" height="24" style="animation:t2 1.68s steps(48) 1.95s forwards"/>
+    <text class="l" x="24" y="150" style="animation-delay:3.9s">Snapshot <tspan class="id">f810a15fb5ed</tspan> before cleanup</text>
+
+    <text class="l" x="24" y="174" style="animation-delay:4.4s"><tspan class="p">$</tspan> <tspan class="c">rm -rf ~/notes/drafts</tspan></text>
+    <rect class="cover" x="40" y="157" width="187" height="24" style="animation:t3 0.74s steps(21) 4.45s forwards"/>
+    <text class="l m" x="336" y="174" style="animation-delay:5.2s"># oops</text>
+
+    <text class="l" x="24" y="198" style="animation-delay:5.8s"><tspan class="p">$</tspan> <tspan class="c">snapvault -C ~/notes diff</tspan></text>
+    <rect class="cover" x="40" y="181" width="221" height="24" style="animation:t4 0.88s steps(25) 5.85s forwards"/>
+    <text class="l" x="24" y="222" style="animation-delay:7s"><tspan class="del">D</tspan><tspan x="91">drafts/launch-email.md</tspan></text>
+    <text class="l" x="24" y="246" style="animation-delay:7s"><tspan class="del">D</tspan><tspan x="91">drafts/q3-plan.md</tspan></text>
+    <text class="l" x="24" y="270" style="animation-delay:7s">2 changes</text>
+
+    <text class="l" x="24" y="294" style="animation-delay:7.7s"><tspan class="p">$</tspan> <tspan class="c">snapvault -C ~/notes restore HEAD --force</tspan></text>
+    <rect class="cover" x="40" y="277" width="359" height="24" style="animation:t5 1.44s steps(41) 7.75s forwards"/>
+    <text class="l" x="24" y="318" style="animation-delay:9.5s">Restored <tspan class="id">f810a15fb5ed</tspan> to ~/notes</text>
+
+    <text class="l" x="24" y="342" style="animation-delay:10.1s"><tspan class="p">$</tspan> <tspan class="c">java/snapvault -C ~/notes diff</tspan></text>
+    <rect class="cover" x="40" y="325" width="264" height="24" style="animation:t6 1.05s steps(30) 10.15s forwards"/>
+    <text class="l m" x="336" y="342" style="animation-delay:11.25s"># the Java build</text>
+    <text class="l ok" x="24" y="366" style="animation-delay:11.5s">No changes.</text>
+
+    <text class="l" x="24" y="390" style="animation-delay:12.1s"><tspan class="p">$</tspan> <tspan class="c">snapvault-fsck ~/notes</tspan></text>
+    <rect class="cover" x="40" y="373" width="196" height="24" style="animation:t7 0.77s steps(22) 12.15s forwards"/>
+    <text class="l m" x="336" y="390" style="animation-delay:12.95s"># the C++ checker</text>
+    <text class="l" x="24" y="414" style="animation-delay:13.2s">checked 8 objects: <tspan class="ok">0 errors, 0 warnings</tspan></text>
+
+    <text class="l" x="24" y="438" style="animation-delay:13.7s"><tspan class="p">$</tspan></text>
+    <rect class="cursor" x="41" y="425" width="8" height="17"/>
+  </g>
+</svg>
