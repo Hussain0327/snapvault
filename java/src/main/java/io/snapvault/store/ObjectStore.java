@@ -7,18 +7,18 @@ import java.util.List;
 
 /** A content-addressed store for typed, immutable objects. */
 public interface ObjectStore {
-    String put(ObjectType type, byte[] payload) throws IOException;
+  String put(ObjectType type, byte[] payload) throws IOException;
 
-    String putBlob(Path source) throws IOException;
+  String putBlob(Path source) throws IOException;
 
-    StoredObject get(String objectId) throws IOException;
+  StoredObject get(String objectId) throws IOException;
 
-    void copyPayload(String objectId, ObjectType expectedType, OutputStream destination)
-            throws IOException;
+  void copyPayload(String objectId, ObjectType expectedType, OutputStream destination)
+      throws IOException;
 
-    boolean contains(String objectId);
+  boolean contains(String objectId);
 
-    List<String> findByPrefix(String prefix) throws IOException;
+  List<String> findByPrefix(String prefix) throws IOException;
 
-    long count() throws IOException;
+  long count() throws IOException;
 }
